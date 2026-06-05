@@ -1,0 +1,8 @@
+# No external dependencies required for the core functionality
+# This file is kept for future extensions (e.g., dnspython for advanced DNS)
+dnspython
+colorama
+prettytable
+rich
+scapy
+python-nmap
