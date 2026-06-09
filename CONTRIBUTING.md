@@ -44,5 +44,4 @@ Since Spectra Scan is a security tool, please adhere to these rules:
 ### 4. License
 By submitting a pull request, you agree that your contributions will be licensed under the project's license (to be added).
 
----
 
