@@ -21,8 +21,8 @@
 - **🕵️‍♂️ Advanced Recon**: Ping sweep, ARP scan, and traceroute capabilities.
 
 ### Advanced Features
-- **Brute Force**: `python SpectraScann.py -t <target> --brute-force --wordlist <path>`
-- **Web Enumeration**: `python SpectraScann.py -t <target> --web-enum --wordlist <path>`
+- **Brute Force**: `python SpectraScan.py -t <target> --brute-force --wordlist <path>`
+- **Web Enumeration**: `python SpectraScnn.py -t <target> --web-enum --wordlist <path>`
 - **CVE Scanning**: `python SpectraScann.py -t <target> --vuln-scan`
 
 ## 📦 Installation

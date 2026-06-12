@@ -22,7 +22,7 @@
   - `--wordlist`: Specifies path to dictionary files.
 
 ### Changed
-- **Refactored `SpectraScann.py`**:
+- **Refactored `SpectraScan.py`**:
   - Removed inline logic for brute-forcing and web enumeration to reduce file size and complexity.
   - Improved import handling to support optional dependencies (`paramiko`, `requests`).
 
