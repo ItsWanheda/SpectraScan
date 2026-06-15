@@ -47,7 +47,7 @@ Examples of unacceptable behavior include:
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at:
 
-**[Your Email]**
+**[wanheda.work@gmail.com]**
 
 All complaints will be reviewed and investigated promptly and fairly.  
 Appropriate action will be taken when necessary to protect the community.
