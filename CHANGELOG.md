@@ -2,16 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [released]
 
 ---
 
-## [2.0.0] - 2026-06-18
+## [2.0.0] - 2026-06-19
 
 ### 🚀 Added
 
 #### SpectraScan Integration
-Integrated a full OSINT suite:
+Integrated a full **OSINT** suite:
 
 - **Domain Scanner** — WHOIS, DNS lookup, host information
 - **IP Scanner** — GeoIP, WHOIS, Shodan integration
@@ -19,12 +19,13 @@ Integrated a full OSINT suite:
 - **Email Scanner** — Reputation checks via `emailrep.io`  
   - suspicious status
   - blacklisted status
-  - breach data **Image EXIF Scanner** — Metadata extraction using `exiv2` or `exiftool`
+  - breach data 
+- **Image EXIF Scanner** — Metadata extraction using `exiv2` or `exiftool`
 - **Link Sniffer** — URL extraction from domains via HackerTarget API
 - **Criminal Scanner** — State record search link generator
 
 #### Report Management System
-Introduced a new `ReportManager` class for handling scan results:
+**Introduced a new `ReportManager` class for handling scan results:**
 
 - **Save / Append** — Stores outputs in `~/.local/share/SpectraScan/` and appends to existing reports
 - **Read / Delete** — CLI commands (`-r`, `-del`) for managing stored reports
