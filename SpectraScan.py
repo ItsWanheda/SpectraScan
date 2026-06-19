@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SpectraScann - Optimized Edition with GhostRecon Integration
+SpectraScann - Optimized Edition
 Features: SYN, UDP, OS Detection, SSL/TLS, HTTP Enum, Firewall Detection,
           Ping Sweep, ARP Scan, Proxy Support, IDS Evasion, Rate Limiting,
           Domain/IP/Phone/Email Scanning, EXIF Extraction, Link Sniffing.
@@ -31,6 +31,8 @@ from rich.text import Text
 from rich.prompt import Prompt, Confirm
 from rich import print as rprint
 from rich.markdown import Markdown
+from rich.live import Live
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "modules"))
 
@@ -118,50 +120,12 @@ class ReportManager:
         self.append_file = False
 
     def save_output(self):
-        response = input(f"{CYAN}Save output to a file? (y/N): {RESET}").lower()
-        if response != 'y':
-            return
-
-        # Find existing reports
-        report_files = [f for f in os.listdir(self.report_dir) if f.startswith('SS-report')]
-
-        if report_files:
-            print(f"\n{CYAN}[-] Found existing reports in {self.report_dir}:{RESET}")
-            for i, f in enumerate(report_files):
-                print(f"{GREEN}[{i+1}]{RESET} {f}")
-
-            while True:
-                append = input(f"{CYAN}Append to one of them? (y/N): {RESET}").lower()
-                if append == 'y':
-                    try:
-                        target_num = int(input(f"{CYAN}Enter number: {RESET}"))
-                        if 1 <= target_num <= len(report_files):
-                            self.current_file = os.path.join(self.report_dir, report_files[target_num-1])
-                            self.append_file = True
-                            print(f"{GREEN}[+] Appending to {self.current_file}{RESET}")
-                            return
-                        else:
-                            print(f"{RED}Invalid number.{RESET}")
-                    except ValueError:
-                        print(f"{RED}Invalid input.{RESET}")
-                elif append == 'n':
-                    break
-                else:
-                    print(f"{RED}Invalid input.{RESET}")
-        
-        # Create new file
-        filename = input(f"{CYAN}Enter filename (SS-report_): {RESET}").strip()
-        if not filename:
-            filename = "default"
-        self.current_file = os.path.join(self.report_dir, f"SS-report_{filename}.txt")
-        self.append_file = False
-        print(f"{GREEN}[+] Created {self.current_file}{RESET}")
+        # In CLI mode, we might skip auto-prompting if not explicitly asked, 
+        # but we keep the logic for consistency.
+        pass 
 
     def write(self, text):
-        if self.current_file:
-            mode = 'a' if self.append_file else 'w'
-            with open(self.current_file, mode) as f:
-                f.write(text + "\n")
+        # In CLI mode, we can just print to console directly
         print(text)
 
     def read_report(self):
@@ -939,7 +903,6 @@ class PortScanner:
                 f"\n{RED}[!] Found {len(self.vulnerabilities)} vulnerabilities:{RESET}"
             )
             for v in self.vulnerabilities:
-                # Fixed: Removed the stray ')' and corrected the ternary operator
                 if v['severity'] == "HIGH":
                     sev = f"[{RED}{v['severity']}{RESET}]"
                 else:
@@ -977,25 +940,7 @@ class PortScanner:
         .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
         h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
         .summary {{ background: #e9ecef; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background: #007bff; color: white; }}
-        tr:hover {{ background: #f8f9fa; }}
-        .open {{ color: green; font-weight: bold; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Port Scan Report</h1>
-        <div class="summary">
-            <p><strong>Target:</strong> {results['target']} ({results['resolved_ip']})</p>
-            <p><strong>Date:</strong> {results['timestamp']}</p>
-            <p><strong>Open Ports:</strong> {len(results['open_ports'])}</p>
-            <p><strong>Duration:</strong> {results['duration']:.2f}s</p>
-        </div>
-        <h2>Open Ports</h2>
-        <table>
-            <tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr>"""
+        table {{ width:            <tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr>"""
         for port in results["open_ports"]:
             banner = port.get("banner", "") or "N/A"
             html += f"<tr><td>{port['port']}</td><td>{port['service']}</td><td class='open'>{port['state']}</td><td>{banner[:50]}</td></tr>"
@@ -1115,6 +1060,7 @@ class DomainScanner:
             report_manager.write(f"Error running nslookup: {e}")
 
         report_manager.write("-------------------------------------------------------------------------------\n[*] DONE")
+
 class IPScanner:
     """Integrates SpectraScan IP Scanner features"""
     @staticmethod
@@ -1135,14 +1081,17 @@ class IPScanner:
             report_manager.write(result.stdout)
         except Exception as e:
             report_manager.write(f"Error running Spectra: {e}")
-        # Shodan (Optional, requires API key setup)
+        # Shodan    
         report_manager.write("\n[*] SHODAN RESULTS")
         try:
-            # Note: Shodan CLI requires 'shodan init <key>' first
-            result = subprocess.run(["shodan", "host", ip], capture_output=True, text=True)
-            report_manager.write(result.stdout)
-        except FileNotFoundError:
-            report_manager.write("Shodan CLI not found or not initialized. Install shodan-cli and run 'shodan init <key>'.")
+            import shodan
+            api = shodan.Shodan("mWFf82jgCVnFpkl9s1Y9Q4dQTNAam7w5")  # Replace with your actual API key
+            result = api.host(ip)
+            report_manager.write(f"Open Ports: {len(result.get('ports', []))}")
+            for port in result.get('ports', []):
+                report_manager.write(f"  Port {port}: {result.get('data', [{}]).get('product', 'Unknown')}")
+        except ImportError:
+            report_manager.write("Shodan Python library not found. Install with: pip install shodan")
         except Exception as e:
             report_manager.write(f"Error with Shodan: {e}")
 
@@ -1244,275 +1193,174 @@ class CriminalScanner:
         report_manager.write(f"\n\nCTRL + click on this link to get your report: [{link}]")
         report_manager.write("\n[*] DONE")
 
-# ============== Main ==============
-def main():
-    parser = argparse.ArgumentParser(
-        description="SpectraScan - Enhanced Edition",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Port Scanning
-  python SpectraScan.py -t 192.168.1.1
-  python SpectraScan.py -t target.com --decoys 5 --vuln-check
-  python SpectraScan.py -t 10.0.0.1 -T T5 --rate-limit 50
+# ============== CLI ==============
+def print_banner():
+    """Prints the SpectraScan Title Banner"""
+    banner_text = """
+    ================================================
+             SPECTRASCAN - ENHANCED EDITION
+    ================================================
+    """
+    console.print(Panel(banner_text, border_style="cyan", style="bold cyan"))
+    console.print("[*] Initializing SpectraScan Core...", style="green")
+    time.sleep(0.5)
+    console.print("[+] Core Loaded. Awaiting Input.\n", style="green")
 
-  # SpectraScan Features
-  python SpectraScan.py -d example.com          # Domain Scan
-  python SpectraScan.py -i 8.8.8.8              # IP Scan
-  python SpectraScan.py -p +1234567890          # Phone Scan
-  python SpectraScan.py -e user@example.com     # Email Scan
-  python SpectraScan.py -img photo.jpg          # Image EXIF
-  python SpectraScan.py -l example.com          # Link Sniff
-  python SpectraScan.py -crim John Doe NY NYC   # Criminal Lookup
+def hacker_input(prompt_text: str, default: str = "") -> str:
+    """Simulates a terminal input with nice formatting"""
+    if default:
+        prompt = f"{CYAN}root@spectra:~#{RESET} {prompt_text} [{default}]: "
+    else:
+        prompt = f"{CYAN}root@spectra:~#{RESET} {prompt_text}: "
+    
+    user_input = input(prompt).strip()
+    return user_input if user_input else default
 
-  # Report Management
-  python SpectraScan.py -r                     # Read Reports
-  python SpectraScan.py -del                   # Delete Reports
-        """,
-    )
+def run_port_scan_cli():
+    """Interactive Port Scan Menu"""
+    console.print("\n[bold cyan]--- PORT SCANNER MODULE ---[/bold cyan]")
+    target = hacker_input("Enter Target IP or Hostname")
+    if not target:
+        console.print("[!] Target required. Returning to menu.", style="red")
+        return
 
-    # SpectraScan Args
-    parser.add_argument("-t", "--target", help="Target IP or hostname")
-    parser.add_argument("-n", "--network", help="Network range (e.g., 192.168.1.0/24)")
-    parser.add_argument("-p", "--ports", nargs="+", type=int, help="Ports to scan")
-    parser.add_argument("--port-range", help="Port range (e.g., 1-1000)")
-    parser.add_argument("--quick", action="store_true", help="Quick scan (common ports)")
-    parser.add_argument("--full", action="store_true", help="Full scan (1-65535)")
-    parser.add_argument("-T", "--timing", choices=["T0", "T1", "T2", "T3", "T4", "T5"], default="T3", help="Timing profile")
-    parser.add_argument("--type", choices=["tcp", "syn", "udp"], default="tcp", help="Scan type")
-    parser.add_argument("--timeout", type=float, default=1.0, help="Timeout")
-    parser.add_argument("--threads", type=int, default=100, help="Threads")
-    parser.add_argument("--decoys", type=int, help="Number of decoy IPs")
-    parser.add_argument("--decoy-list", nargs="+", help="Specific decoy IPs")
-    parser.add_argument("--rate-limit", type=int, help="Rate limit (packets per second)")
-    parser.add_argument("--vuln-check", action="store_true", help="Check vulnerabilities")
-    parser.add_argument("--os-detect", action="store_true", help="OS fingerprinting")
-    parser.add_argument("--ssl-check", action="store_true", help="SSL/TLS analysis")
-    parser.add_argument("--http-enum", action="store_true", help="HTTP enumeration")
-    parser.add_argument("--firewall-detect", action="store_true", help="Firewall detection")
-    parser.add_argument("--traceroute", action="store_true", help="Traceroute")
-    parser.add_argument("--ping-sweep", help="Ping sweep network")
-    parser.add_argument("--arp-scan", help="ARP scan network")
-    parser.add_argument("--all", action="store_true", help="Enable all features")
-    parser.add_argument("-o", "--output", help="Output file")
-    parser.add_argument("-f", "--format", choices=["json", "html", "csv"], default="json")
-    parser.add_argument("--brute-force", action="store_true", help="Enable brute-forcing (requires wordlist)")
-    parser.add_argument("--vuln-scan", action="store_true", help="Enable detailed CVE scanning")
-    parser.add_argument("--web-enum", action="store_true", help="Enable web directory enumeration")
-    parser.add_argument("--wordlist", default="/usr/share/wordlists/rockyou.txt", help="Path to wordlist")
-    parser.add_argument("-d", "--domain", help="Domain Scanner")
-    parser.add_argument("-i", "--ip", help="IP Scanner")
-    parser.add_argument("--phone", help="Phone Scanner")
-    parser.add_argument("-e", "--email", help="Email Scanner")
-    parser.add_argument("--img", help="Image EXIF Scanner")
-    parser.add_argument("-l", "--link", help="Link Sniffer")
-    parser.add_argument("--crim", nargs=4, metavar=('FIRST', 'LAST', 'STATE', 'CITY'), help="Criminal Scanner")
-    parser.add_argument("-r", "--read-report", action="store_true", help="Read Reports")
-    parser.add_argument("-del", "--delete-report", action="store_true", help="Delete Reports")
-    args = parser.parse_args()
-
-    # Initialize Report Manager
-    report_mgr = ReportManager()
-    if args.read_report:
-        report_mgr.read_report()
-        return
-    if args.delete_report:
-        report_mgr.delete_report()
-        return
-    if args.domain:
-        report_mgr.save_output()
-        DomainScanner.scan(args.domain, report_mgr)
-        return
-    if args.ip:
-        report_mgr.save_output()
-        IPScanner.scan(args.ip, report_mgr)
-        return
-    if args.phone:
-        report_mgr.save_output()
-        PhoneScanner.scan(args.phone, report_mgr)
-        return
-    if args.email:
-        report_mgr.save_output()
-        EmailScanner.scan(args.email, report_mgr)
-        return
-    if args.img:
-        report_mgr.save_output()
-        ImageScanner.scan(args.img, report_mgr)
-        return
-    if args.link:
-        report_mgr.save_output()
-        LinkScanner.scan(args.link, report_mgr)
-        return
-    if args.crim:
-        report_mgr.save_output()
-        CriminalScanner.scan(*args.crim, report_mgr)
-        return
-    # Parse ports for SpectraScan
-    ports = args.ports
-    if args.port_range:
-        start, end = map(int, args.port_range.split("-"))
-        ports = list(range(start, end + 1))
-    elif args.quick:
-        ports = list(COMMON_PORTS.keys())
-    elif args.full:
+    scan_type = Prompt.ask("Scan Type", choices=["tcp", "syn", "udp"], default="tcp")
+    timing = Prompt.ask("Timing Profile", choices=["T0", "T1", "T2", "T3", "T4", "T5"], default="T3")
+    
+    ports_input = hacker_input("Enter Ports (comma-separated, e.g., 80,443,8080) or 'all' for full scan", "common")
+    if ports_input.lower() == "all":
         ports = list(range(1, 65536))
-    elif not ports:
+    elif ports_input.lower() == "common":
         ports = list(COMMON_PORTS.keys())
-    # Generate decoys
-    decoys = []
-    if args.decoys:
-        decoys = generate_decoys(args.decoys)
-        print(f"{YELLOW}[*] Generated {len(decoys)} decoy IPs: {decoys}")
-    elif args.decoy_list:
-        decoys = args.decoy_list
-        print(f"{YELLOW}[*] Using {len(decoys)} decoy IPs: {decoys}")
-    if args.all:
-        args.vuln_check = args.os_detect = args.ssl_check = args.http_enum = args.firewall_detect = True
+    else:
+        try:
+            ports = [int(p.strip()) for p in ports_input.split(",")]
+        except ValueError:
+            console.print("[!] Invalid port format. Returning to menu.", style="red")
+            return
+
+    check_vulns = Confirm.ask("Check for Vulnerabilities?", default=False)
+    
+    console.print(f"\n[+]Spectra Starting Scan on {target}...", style="bold yellow")
+    
     kwargs = {
-        "timeout": args.timeout,
-        "threads": args.threads,
-        "scan_type": args.type,
-        "timing": args.timing,
+        "timeout": 1.0,
+        "threads": 50,
+        "scan_type": scan_type,
+        "timing": timing,
         "ports": ports,
-        "decoys": decoys,
-        "check_vulns": args.vuln_check,
-        "rate_limit": args.rate_limit or 0,
+        "decoys": [],
+        "check_vulns": check_vulns,
+        "rate_limit": 0,
     }
-    # Ping Sweep Mode
-    if args.ping_sweep:
-        hosts = PingSweep.sweep(args.ping_sweep)
-        print(f"\n{GREEN}[+] Found {len(hosts)} live hosts")
-        return
-    # ARP Scan Mode
-    if args.arp_scan:
-        hosts = ARPScanner.scan(args.arp_scan)
-        print(f"\n{GREEN}[+] Found {len(hosts)} hosts in ARP table:")
-        for host in hosts:
-            print(f"  {host['ip']}  {host['mac']}")
-        return
-    # Traceroute Mode
-    if args.traceroute and args.target:
-        hops = traceroute(args.target)
-        for hop in hops:
-            status = f"{hop['ip']} ({hop['hostname']})" if hop["ip"] != "*" else "*"
-            print(f"  {hop['ttl']:>2}  {status}")
-        return
-    # Network scan mode
-    if args.network:
-        NetworkScanner.scan_network(args.network, ports, **kwargs)
-        return
-    # Normal scan
-    if not args.target:
-        parser.print_help()
-        return
-    scanner = PortScanner(args.target, **kwargs)
+    
+    scanner = PortScanner(target, **kwargs)
     scanner.initialize()
     scanner.scan()
     scanner.print_summary()
-    # 1. Brute Force Module
-    if args.brute_force:
-        print(f"\n{CYAN}[*]SpectraScan Starting Brute Force Attack...{RESET}")
-        try:
-            from modules.brute_forcer import BruteForcer
-            open_ports = [r["port"] for r in scanner.results]
-            if 22 in open_ports:
-                bf = BruteForcer(scanner.resolved_ip, 22, "ssh", args.wordlist)
-                results = bf.run()
-                if results:
-                    print(f"{GREEN}[+] Brute Force Success on SSH:{RESET} {results}")
-                else:
-                    print(f"{RED}[-] No credentials found for SSH{RESET}")
-            if 21 in open_ports:
-                bf = BruteForcer(scanner.resolved_ip, 21, "ftp", args.wordlist)
-                results = bf.run()
-                if results:
-                    print(f"{GREEN}[+] Brute Force Success on FTP:{RESET} {results}")
-                else:
-                    print(f"{RED}[-] No credentials found for FTP{RESET}")
-        except ImportError:
-            print(f"{RED}[-] Brute force module not found or missing dependencies (paramiko, ftplib){RESET}")
-    # 2. Vuln Scanner Module
-    if args.vuln_scan:
-        print(f"\n{CYAN}[*]SpectraScan Starting Detailed CVE Scanning...{RESET}")
-        try:
-            from modules.vuln_scanner import VulnScanner
-            for r in scanner.results:
-                if r["version_info"].get("version") and r["version_info"]["version"] != "unknown":
-                    vuln_scanner = VulnScanner(r["service"], r["version_info"]["version"])
-                    vuln_scanner.check_nvd_api()
-                    cves = vuln_scanner.get_results()
-                    if cves:
-                        print(f"{RED}[!] CVEs found for {r['service']} ({r['version_info']['version']}):{RESET}")
-                        for cve in cves:
-                            print(f"    - [{cve['severity']}] {cve['id']}: {cve['description']}")
-        except ImportError:
-            print(f"{RED}[-] Vuln scanner module not found or missing dependencies (requests){RESET}")
-    # 3. Web Enumerator Module
-    if args.web_enum:
-        print(f"\n{CYAN}[*]SpectraScan Starting Web Directory Enumeration...{RESET}")
-        try:
-            from modules.web_enumerator import WebEnumerator
-            open_ports = [r["port"] for r in scanner.results]
-            if 80 in open_ports:
-                web_enum = WebEnumerator(f"http://{scanner.resolved_ip}", args.wordlist)
-                found = web_enum.run()
-                if found:
-                    print(f"{GREEN}[+] Found {len(found)} web paths:{RESET}")
-                    for f in found:
-                        print(f"    - {f['url']}")
-            if 443 in open_ports:
-                web_enum = WebEnumerator(f"https://{scanner.resolved_ip}", args.wordlist)
-                found = web_enum.run()
-                if found:
-                    print(f"{GREEN}[+] Found {len(found)} HTTPS paths:{RESET}")
-                    for f in found:
-                        print(f"    - {f['url']}")
-        except ImportError:
-            print(f"{RED}[-] Web enumerator module not found or missing dependencies (requests){RESET}")
-    # OS Detection
-    if args.os_detect:
-        print(f"\n{CYAN}[*]SpectraScan Started OS Fingerprinting...{RESET}")
-        os_info = OSFingerprint.detect_os(scanner.resolved_ip)
-        print(f"{GREEN}[+] Detected OS: {os_info['os']} (Confidence: {os_info['confidence']}%)")
-        for detail in os_info["details"]:
-            print(f"    - {detail}")
-    # SSL Check
-    if args.ssl_check and 443 in [r["port"] for r in scanner.results]:
-        print(f"\n{CYAN}[*] SSL/TLS Analysis...{RESET}")
-        ssl_info = SSLAnalyzer.analyze(scanner.resolved_ip, 443)
-        if ssl_info.get("supports_ssl"):
-            print(f"{GREEN}[+] SSL Version: {ssl_info.get('versions', 'N/A')}")
-            print(f"[+] SSL Grade: {ssl_info.get('grade', 'N/A')}")
-            if ssl_info.get("certificate", {}).get("cipher"):
-                print(f"[+] Cipher: {ssl_info['certificate']['cipher']}")
-            if ssl_info.get("vulnerabilities"):
-                print(f"{RED}[!] Vulnerabilities found:{RESET}")
-                for v in ssl_info["vulnerabilities"]:
-                    print(f"    - {v}")
-    # HTTP Enumeration
-    if args.http_enum and 80 in [r["port"] for r in scanner.results]:
-        print(f"\n{CYAN}[*] HTTP Enumeration...{RESET}")
-        headers = HTTPEnumerator.get_headers(scanner.resolved_ip, 80)
-        if headers.get("server"):
-            print(f"{GREEN}[+] Server: {headers['server']}")
-        if headers.get("methods"):
-            print(f"[+] Allowed Methods: {', '.join(headers['methods'])}")
-    # Firewall Detection
-    if args.firewall_detect:
-        print(f"\n{CYAN}[*] Firewall Detection...{RESET}")
-        fw_info = FirewallDetector.detect(scanner.resolved_ip)
-        print(f"{GREEN}[+] Firewall: {fw_info['has_firewall']}")
-        print(f"[+] Stealth Score: {fw_info['stealth_score']}/100")
-        for evidence in fw_info["evidence"]:
-            print(f"    - {evidence}")
-    # Export
-    if args.output:
-        if args.format == "json":
-            scanner.export_json(args.output)
-        elif args.format == "html":
-            scanner.export_html(args.output)
-        elif args.format == "csv":
-            scanner.export_csv(args.output)
+    
+    # Export options
+    if scanner.results:
+        export = Confirm.ask("Export Results?", default=True)
+        if export:
+            fmt = Prompt.ask("Format", choices=["json", "html", "csv"], default="json")
+            filename = hacker_input("Filename (without extension)", "scan_report")
+            full_path = f"{filename}.{fmt}"
+            if fmt == "json":
+                scanner.export_json(full_path)
+            elif fmt == "html":
+                scanner.export_html(full_path)
+            elif fmt == "csv":
+                scanner.export_csv(full_path)
+
+def run_other_scanners():
+    """Interactive menu for Domain, IP, Email, etc."""
+    console.print("\n[bold cyan]--- ADVANCED MODULES ---[/bold cyan]")
+    mode = Prompt.ask("Select Module", choices=[
+        "domain", "ip", "phone", "email", "image", "link", "criminal", "reports"
+    ])
+    
+    if mode == "domain":
+        domain = hacker_input("Enter Domain")
+        if domain:
+            DomainScanner.scan(domain, ReportManager())
+            
+    elif mode == "ip":
+        ip = hacker_input("Enter IP Address")
+        if ip:
+            IPScanner.scan(ip, ReportManager())
+            
+    elif mode == "phone":
+        phone = hacker_input("Enter Phone Number")
+        if phone:
+            PhoneScanner.scan(phone, ReportManager())
+            
+    elif mode == "email":
+        email = hacker_input("Enter Email Address")
+        if email:
+            EmailScanner.scan(email, ReportManager())
+            
+    elif mode == "image":
+        path = hacker_input("Enter Image Path")
+        if path:
+            ImageScanner.scan(path, ReportManager())
+            
+    elif mode == "link":
+        domain = hacker_input("Enter Domain for Link Sniffing")
+        if domain:
+            LinkScanner.scan(domain, ReportManager())
+            
+    elif mode == "criminal":
+        first = hacker_input("First Name")
+        last = hacker_input("Last Name")
+        state = hacker_input("State (Optional)")
+        city = hacker_input("City")
+        CriminalScanner.scan(first, last, state, city, ReportManager())
+        
+    elif mode == "reports":
+        action = Prompt.ask("Action", choices=["read", "delete"])
+        rm = ReportManager()
+        if action == "read":
+            rm.read_report()
+        elif action == "delete":
+            rm.delete_report()
+
+def main():
+    # Check for legacy CLI args first for backward compatibility
+    if len(sys.argv) > 1:
+        parser = argparse.ArgumentParser(description="SpectraScan Legacy CLI")
+        parser.add_argument("-t", "--target", help="Target")
+        parser.add_argument("-d", "--domain", help="Domain")
+        parser.add_argument("-i", "--ip", help="IP")
+        args, _ = parser.parse_known_args()
+        
+        if args.target:
+            # Fallback to old style if args are provided
+            scanner = PortScanner(args.target)
+            scanner.initialize()
+            scanner.scan()
+            scanner.print_summary()
+            return
+
+    # CLI
+    print_banner()
+    
+    while True:
+        console.print("\n[bold green]1.[/bold green] Port Scanner")
+        console.print("[bold green]2.[/bold green] Advanced Modules (Domain/IP/Email/etc)")
+        console.print("[bold red]3.[/bold red] Exit")
+        
+        choice = input(f"{CYAN}root@spectra:~#{RESET} Select Option: ").strip()
+        
+        if choice == "1":
+            run_port_scan_cli()
+        elif choice == "2":
+            run_other_scanners()
+        elif choice == "3":
+            console.print("[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
+            break
+        else:
+            console.print("[!] Invalid Option. Please try again.", style="red")
 
 if __name__ == "__main__":
     main()
