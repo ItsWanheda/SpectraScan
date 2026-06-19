@@ -1,4 +1,4 @@
-# � SpectraScan
+# 🕵️‍♂️ SpectraScan
 
 > **Advanced Network Reconnaissance, Port Scanning & OSINT Intelligence Tool**
 
