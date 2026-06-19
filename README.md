@@ -7,7 +7,7 @@
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
 [![Code Style: Black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-**SpectraScan** is a high-performance, multi-threaded network intelligence framework written in Python. It bridges the gap between traditional port scanning and deep reconnaissance by integrating OS fingerprinting, SSL/TLS analysis, and a massive **OSINT Suite** (inspired by GhostRecon). 
+**SpectraScan** is a high-performance, multi-threaded network intelligence framework written in Python. It bridges the gap between traditional port scanning and deep reconnaissance by integrating OS fingerprinting, SSL/TLS analysis, and a massive **OSINT Suite**. 
 
 Designed for security professionals, pentesters, and network administrators who need a single, modular tool for end-to-end target profiling.
 
@@ -16,78 +16,89 @@ Designed for security professionals, pentesters, and network administrators who 
 ## ✨ Features
 
 ### 🛠️ Core Scanning Engine
-*High-speed network enumeratio and service identification.*
-- **🔍 Multi-Protocol Scanning**: TCP, SYN and UDP scanning with configurable timing profiles.
-- **🛡️ Stealth & vasion**: Decoy generation, rate limiting, and firewall detection.
-- **�️ OS Fingerprinting**: TTL and response-time-based OS detection.
-- **� SSL/TLS Analysis**: Certificate inspection, cipher suite analysis, and protocol version checking.
-- **🌐 HTTP Enumeration**: Server header analysis, allowe methods, and path discovery.
-- **🕵️‍♂️ Advanced Recon**: Ping swee, ARP scan, and traceroute capabilities.
-- **⚡ High Performance**: Optimized with `concurrent.futures` and async-friendly structures.
+*High-speed network enumeration and service identification.*
+
+- **🔍 Multi-Protocol Scanning** — TCP, SYN, and UDP scanning with configurable timing profiles.
+- **🛡️ Firewall Detection** — Basic firewall and filtering behavior analysis.
+- **🕵️ OS Fingerprinting** — TTL and response-time-based OS detection.
+- **🔐 SSL/TLS Analysis** — Certificate inspection, cipher suite analysis, and protocol version checks.
+- **🌐 HTTP Enumeration** — Server header analysis, allowed methods, and path discovery.
+- **📡 Advanced Recon** — Ping sweep, ARP scan, and traceroute-related discovery workflows.
+- **⚡ High Performance** — Built with optimized structures and concurrency-friendly design.
 
 ### 🕵️ OSINT Intelligence Suite
-*Deep-dive intelligence gathering for digital footprining.*
-- **🌐 Domain Intelligence**: WHOIS, DNS Lookup, and host informatio.
-- **📍 IP Intelligence**: GeoIP location, WHOIS, and Shodan integratio.
-- **📞 Phone Intelligence**: Carrier and location lookup via NumVerify AP.
-- **📧 Email Intelligence**: Reputation analysis (suspicious, blackliste, and breach data).
-- **🖼️ Metadata Extraction**: Image EXIF data harvestin.
-- **🔗 Link Sniffing**: Automated URL extraction from target domains.
- **👮 Criminal Record Lookup**: Generates state-specific record search link.
+*Deep-dive intelligence gathering for digital footprinting.*
+
+- **🌐 Domain Intelligence** — WHOIS, DNS lookup, and host information.
+- **📍 IP Intelligence** — GeoIP, WHOIS, and Shodan integration.
+- **📞 Phone Intelligence** — Carrier and location lookup via NumVerify API.
+- **📧 Email Intelligence** — Reputation analysis via `emailrep.io.
+- **🖼️ Metadata Extraction** — Image EXIF data harvesting using `exiv2` or `exiftool`
+- **🔗 Link Sniffing** — Automated URL extraction from target domains via HackerTarget API.
+- **👮 Criminal Record Lookup** — Generates state-specific record search links.
 
 ### ⚔️ Attack & Vulnerability Modules
-- **💥 Brute Force**: Dictionar-based attacks for SSH and FTP services.
-- **🛡️ CVE Scanner**: Real-tim vulnerability detection via NVD API integration.
-- **📂 Web Fuzzing**: Advance directory and file enumeration for web servers.
+- **💥 Brute Force** — Dictionary-based attacks for SSH and FTP services.
+- **🛡️ CVE Scanner** — Real-time vulnerability detection via NVD API integration.
+- **📂 Web Fuzzing** — Advanced directory and file enumeration for web servers.
 
 ### 📁 Report Managemen
-- **📊 Rich Reporting**: Export results to **JSON, CSV, and beautiful HTM** reports.
-- **💾 Persistence**: Save/Append scan results to local storag (`~/.local/share/SpectraScan/`).
-- **📂 Management**: Integrated CLI command to read or delete historical reports.
+- **📊 Rich Reporting** — Export results to **JSON, CSV, and HTML**
+- **💾 Persistence** — Save and append scan results to local storage at `~/.local/share/SpectraScan/`
+- **📂 History Management** — Read or delete stored reports from the CLI.
 
 ---
 
 ## 🚀 Usage
 
 ### 🔹 Basic Recnaissance
+
 **Standard Port Scan**
 ```bash
 python SpectraScan.py -t 192.168.1.1
 ```
+
 **Aggressive Scan with OS Detection**
 ```bash
 python SpectraScan.py -t example.com --os-detect -T T4
 ```
 
 ### 🔹 OSINT & Intelligence
+
 **Email Reputation Check**
 ```bash
 python SpectraScan.py -e target@example.com
 ```
+
 **Domain & Link Sniffing**
 ```bash
 python SpectraScan.py -d targetdomain.com -l
 ```
 
 ### 🔹 Advanced Modules
+
 **Vulnerability Scanning (CVE)**
 ```bash
 python SpectraScan.py -t target.com --vuln-scan
 ```
+
 **Brute Force Attack**
 ```bash
 python SpectraScan.py -t 10.0.0.5 --brute-force --wordlist ./passwords.txt
 ```
+
 **Web Directory Enumeration**
 ```bash
 python SpectraScan.py -t example.com --web-enum --wordlist ./dirb_list.txt
 ```
 
 ### 🔹 Report Management
+
 **View Saved Reports**
 ```bash
 python SpectraScan.py -r
 ```
+
 **Generate HTML Report**
 ```bash
 python SpectraScan.py -t target.com -o report.html -f html
@@ -133,6 +144,54 @@ pip install -r requirements.txt
 ```
 
 ---
+
+## Quick Start
+> If you’re running the standalone script:
+```bash
+pip install rich
+python SpectraScan.py
+```
+
+---
+
+## 🧭 CLI Menu
+**The interactive CLI provides:**
+
+1. **Port Scanner**
+* Target IP/Hostname
+* Scan Type
+* Timing Profile
+* Ports selection
+2. **Advanced Modules**
+* Domain Scanner
+* IP Scanner
+* Email Scanner
+* Phone Scanner
+3. **EXIT**
+
+---
+
+## 🧩 Project Structure
+```text
+SpectraScan/
+├── SpectraScan.py
+├── modules/
+│   ├── brute_forcer.py
+│   ├── vuln_scanner.py
+│   ├── web_enumerator.py
+│   └── phone_Locator.py
+├── CHANGELOG.md
+├── README.md
+└── requirements.txt
+```
+
+---
+
+## 🛡️ Security Notes
+* Brute-force attempts include rate limiting and timeout controls to reduce noise and lockout risk
+* External lookups may depend on third-party APIs and tools
+* Some features may require elevated privileges or platform-specific command flags
+* Cross-platform support has been improved for Windows, Linux, and macOS
 
 ## 🤝 Contributing
 > Contributions are what make the open-source community such an amazing place to learn, inspire, and create.
