@@ -3,10 +3,11 @@
 dnspython
 colorama
 prettytable
-rich
 scapy
 python-nmap
 paramiko
 requests
 fpdf
 pyyaml
+rich>=13.0
+impacket>=0.10.0
