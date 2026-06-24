@@ -20,6 +20,7 @@ import subprocess
 import re
 import csv
 import ipaddress
+import html
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from urllib.request import urlopen, Request
@@ -41,28 +42,53 @@ console = Console()
 
 # ============== Configuration ==============
 COMMON_PORTS = {
-    21: ("FTP", "File Transfer Protocol"),
-    22: ("SSH", "Secure Shell"),
-    23: ("Telnet", "Telnet"),
-    25: ("SMTP", "Mail Server"),
-    53: ("DNS", "Domain Name System"),
-    80: ("HTTP", "Web Server"),
-    110: ("POP3", "Mail Retrieval"),
-    143: ("IMAP", "Mail Access"),
-    443: ("HTTPS", "Secure Web"),
-    445: ("SMB", "SMB/CIFS"),
-    993: ("IMAPS", "Secure IMAP"),
-    995: ("POP3S", "Secure POP"),
-    1433: ("MSSQL", "MS SQL Server"),
-    1521: ("Oracle", "Oracle DB"),
-    3306: ("MySQL", "MySQL Server"),
-    3389: ("RDP", "Remote Desktop"),
-    5432: ("PostgreSQL", "PostgreSQL"),
-    5900: ("VNC", "VNC"),
-    6379: ("Redis", "Redis"),
-    8080: ("HTTP-Alt", "Alt HTTP"),
-    8443: ("HTTPS-Alt", "Alt HTTPS"),
-    27017: ("MongoDB", "MongoDB"),
+    21: "FTP",
+    22: "SSH",
+    23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
+    80: "HTTP",
+    110: "POP3",
+    143: "IMAP",
+    443: "HTTPS",
+    445: "SMB",
+    993: "IMAPS",
+    995: "POP3S",
+    1433: "MSSQL",
+    1521: "Oracle",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    5900: "VNC",
+    6379: "Redis",
+    8080: "HTTP-Alt",
+    8443: "HTTPS-Alt",
+    27017: "MongoDB",
+}
+
+PORT_DESCRIPTIONS = {
+    21: "File Transfer Protocol",
+    22: "Secure Shell",
+    23: "Telnet",
+    25: "Mail Server",
+    53: "Domain Name System",
+    80: "Web Server",
+    110: "Mail Retrieval",
+    143: "Mail Access",
+    443: "Secure Web",
+    445: "SMB/CIFS",
+    993: "Secure IMAP",
+    995: "Secure POP",
+    1433: "MS SQL Server",
+    1521: "Oracle DB",
+    3306: "MySQL Server",
+    3389: "Remote Desktop",
+    5432: "PostgreSQL",
+    5900: "VNC",
+    6379: "Redis",
+    8080: "Alt HTTP",
+    8443: "Alt HTTPS",
+    27017: "MongoDB",
 }
 
 VULNERABILITIES = {
@@ -324,8 +350,23 @@ class SYNScan:
         return ip_header + tcp_header
 
     def scan(self, target_ip: str, port: int, timeout: float = 2.0) -> str:
+        # Fall back to TCP connect scan if we don't have raw socket privileges
         if not self.is_admin:
-            return "admin_required"
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                rc = sock.connect_ex((target_ip, port))
+                sock.close()
+                if rc == 0:
+                    return "open"
+                elif rc in (111, 10061):  # ECONNREFUSED
+                    return "closed"
+                else:
+                    return "filtered"
+            except socket.timeout:
+                return "filtered"
+            except:
+                return "error"
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
@@ -368,12 +409,13 @@ class UDPScan:
         }
 
     def scan(self, target_ip: str, port: int, timeout: float = 3.0) -> Dict:
+        svc_tuple = self.common_udp_ports.get(port, ("unknown", ""))
         result = {
             "port": port,
             "protocol": "udp",
             "state": "open|filtered",
-            "service": self.common_udp_ports.get(port, ("unknown", "")),
-            "info": self.common_udp_ports.get(port, ("unknown", "")),
+            "service": svc_tuple,
+            "info": svc_tuple,
         }
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -729,16 +771,29 @@ class ARPScanner:
     def scan(network: str) -> List[Dict]:
         hosts = []
         try:
+            # Determine the network prefix (e.g., "192.168.1.") for membership testing
+            try:
+                net = ipaddress.ip_network(network, strict=False)
+                net_hosts = {str(ip) for ip in net.hosts()}
+            except ValueError:
+                net_hosts = None
+
             cmd = ["arp", "-a"] if sys.platform == "win32" else ["arp", "-a", "-n"]
             output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
             for line in output.split("\n"):
                 match = re.search(
-                    r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-f-]+)\s+(\w+)", line, re.IGNORECASE
+                    r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-f:-]+)\s+(\w+)",
+                    line,
+                    re.IGNORECASE,
                 )
                 if match:
                     ip, mac, iface = match.groups()
-                    if ip.startswith(network.split(".")):
-                        hosts.append({"ip": ip, "mac": mac, "interface": iface})
+                    if net_hosts is None:
+                        if ip.startswith(".".join(network.split(".")[:3]) + "."):
+                            hosts.append({"ip": ip, "mac": mac, "interface": iface})
+                    else:
+                        if ip in net_hosts:
+                            hosts.append({"ip": ip, "mac": mac, "interface": iface})
         except Exception as e:
             print(f"{RED}[-] ARP scan error: {e}{RESET}")
         return hosts
@@ -751,11 +806,13 @@ def traceroute(target: str, max_hops: int = 30) -> List[Dict]:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(2.0)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
             sock.sendto(b"traceroute", (target, 33434 + ttl))
             data, addr = sock.recvfrom(512)
-            hops.append({"ttl": ttl, "ip": addr, "hostname": reverse_dns(addr)})
+            hop_ip = addr if isinstance(addr, tuple) else addr
+            hops.append({"ttl": ttl, "ip": hop_ip, "hostname": reverse_dns(hop_ip)})
             sock.close()
-            if addr == target:
+            if hop_ip == target:
                 break
         except socket.timeout:
             hops.append({"ttl": ttl, "ip": "*", "hostname": "Timeout"})
@@ -827,8 +884,8 @@ class PortScanner:
             "port": port,
             "protocol": "tcp",
             "state": "closed",
-            "service": COMMON_PORTS.get(port, ("unknown", "")),
-            "description": COMMON_PORTS.get(port, ("unknown", "")),
+            "service": COMMON_PORTS.get(port, "unknown"),
+            "description": PORT_DESCRIPTIONS.get(port, ""),
             "banner": "",
             "version_info": {"type": "unknown", "version": "unknown"},
             "vulnerabilities": [],
@@ -880,14 +937,30 @@ class PortScanner:
         vuln_str = f" {RED}[!]{vuln_count} vulns{RESET}" if vuln_count else ""
         banner = result.get("banner", "") or ""
         banner_display = banner[:50] if len(banner) > 50 else banner
+
+        # Handle service being either a tuple or string
+        service = result.get("service", "unknown")
+        if isinstance(service, tuple):
+            service = service if service else "unknown"
+        service_display = service or "unknown"
+
+        # Description fallback chain: description field -> PORT_DESCRIPTIONS -> service
+        description = result.get("description", "") or PORT_DESCRIPTIONS.get(
+            result.get("port"), service_display
+        )
+        if isinstance(description, tuple):
+            description_display = description if description else ""
+        else:
+            description_display = description
+
         print(
             f"{GREEN}[+] Port {result['port']:>5}/tcp  "
-            f"{result['state']:<10} {result['service']:<12} "
+            f"{result['state']:<10} {service_display:<12} "
             f"{CYAN}| {banner_display}{vuln_str}{RESET}"
         )
 
     def print_summary(self):
-        duration = time.time() - self.start_time
+        duration = time.time() - self.start_time if self.start_time else 0.0
         print(f"\n{CYAN}{'='*60}")
         print(f"{GREEN}[✓] Scan completed in {duration:.2f} seconds")
         print(f"[+] Found {len(self.results)} open ports")
@@ -896,20 +969,21 @@ class PortScanner:
             print(f"{'Port':<10}{'Service':<15}{'State':<10}{'Version'}")
             print(f"{'-'*45}")
             for r in sorted(self.results, key=lambda x: x["port"]):
+                service = r.get("service", "unknown")
+                if isinstance(service, tuple):
+                    service = service if service else "unknown"
                 version = r.get("version_info", {}).get("version", "N/A")
-                print(f"{r['port']:<10}{r['service']:<15}{r['state']:<10}{version}")
+                print(f"{r['port']:<10}{service:<15}{r['state']:<10}{version}")
         if self.vulnerabilities:
-            print(
-                f"\n{RED}[!] Found {len(self.vulnerabilities)} vulnerabilities:{RESET}"
-            )
+            print(f"\n{RED}[!] Found {len(self.vulnerabilities)} vulnerabilities:{RESET}")
             for v in self.vulnerabilities:
-                if v['severity'] == "HIGH":
-                    sev = f"[{RED}{v['severity']}{RESET}]"
-                else:
-                    sev = f"[{YELLOW}{v['severity']}{RESET}]"
-                
+                svc = v.get("service", "unknown")
+                if isinstance(svc, tuple):
+                    svc = svc if svc else "unknown"
+                sev_color = RED if v.get("severity") == "HIGH" else YELLOW
                 print(
-                    f"  {RED}•{RESET} Port {v['port']} ({v['service']}): {v['vulnerability']} {sev}"
+                    f"  {RED}•{RESET} Port {v['port']} ({svc}): "
+                    f"{v['vulnerability']} [{sev_color}{v.get('severity', 'INFO')}{RESET}]"
                 )
         print(f"{CYAN}{'='*60}{RESET}")
 
@@ -919,7 +993,7 @@ class PortScanner:
             "resolved_ip": self.resolved_ip,
             "scan_type": self.scan_type,
             "timestamp": datetime.now().isoformat(),
-            "duration": time.time() - self.start_time,
+            "duration": (time.time() - self.start_time) if self.start_time else 0.0,
             "open_ports": self.results,
             "vulnerabilities": self.vulnerabilities,
         }
@@ -931,25 +1005,67 @@ class PortScanner:
 
     def export_html(self, filename: str):
         results = self.get_results()
-        html = f"""<!DOCTYPE html>
+        target = html.escape(str(results.get("target", "")))
+        scan_type = html.escape(str(results.get("scan_type", "")))
+        resolved_ip = html.escape(str(results.get("resolved_ip", "") or ""))
+        timestamp = html.escape(str(results.get("timestamp", "")))
+        duration = f"{results.get('duration', 0):.2f}"
+
+        parts = [f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>SpectraScan Report - {results['target']}</title>
+    <meta charset="utf-8">
+    <title>SpectraScan Report - {target}</title>
     <style>
         body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
         .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
         h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
         .summary {{ background: #e9ecef; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-        table {{ width:            <tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr>"""
-        for port in results["open_ports"]:
-            banner = port.get("banner", "") or "N/A"
-            html += f"<tr><td>{port['port']}</td><td>{port['service']}</td><td class='open'>{port['state']}</td><td>{banner[:50]}</td></tr>"
-        html += """</table>
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+        th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }}
+        th {{ background: #007bff; color: white; }}
+        tr:hover {{ background: #f1f1f1; }}
+        .open {{ color: #28a745; font-weight: bold; }}
+        .closed {{ color: #dc3545; }}
+        .filtered {{ color: #ffc107; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SpectraScan Report</h1>
+        <div class="summary">
+            <p><strong>Target:</strong> {target}</p>
+            <p><strong>Resolved IP:</strong> {resolved_ip}</p>
+            <p><strong>Scan Type:</strong> {scan_type}</p>
+            <p><strong>Timestamp:</strong> {timestamp}</p>
+            <p><strong>Duration:</strong> {duration}s</p>
+            <p><strong>Open Ports:</strong> {len(results.get('open_ports', []))}</p>
+            <p><strong>Vulnerabilities:</strong> {len(results.get('vulnerabilities', []))}</p>
+        </div>
+        <h2>Open Ports</h2>
+        <table>
+            <tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr>"""]
+
+        for port in results.get("open_ports", []):
+            port_num = html.escape(str(port.get("port", "")))
+            service = port.get("service", "")
+            if isinstance(service, tuple):
+                service = service if service else ""
+            service = html.escape(str(service))
+            state = html.escape(str(port.get("state", "")))
+            banner = html.escape((port.get("banner", "") or "N/A")[:50])
+            parts.append(
+                f"<tr><td>{port_num}</td><td>{service}</td>"
+                f"<td class='open'>{state}</td><td>{banner}</td></tr>"
+            )
+
+        parts.append("""        </table>
     </div>
 </body>
-</html>"""
+</html>""")
+
         with open(filename, "w") as f:
-            f.write(html)
+            f.write("".join(parts))
         print(f"{GREEN}[+] HTML report saved: {filename}")
 
     def export_csv(self, filename: str):
@@ -959,6 +1075,9 @@ class PortScanner:
                 ["Port", "Protocol", "State", "Service", "Banner", "Vulnerabilities"]
             )
             for port in self.results:
+                service = port.get("service", "")
+                if isinstance(service, tuple):
+                    service = service if service else ""
                 banner = port.get("banner", "") or "None"
                 vulns = (
                     "; ".join(
@@ -971,7 +1090,7 @@ class PortScanner:
                         port["port"],
                         "tcp",
                         port["state"],
-                        port["service"],
+                        service,
                         banner[:50],
                         vulns,
                     ]
@@ -1008,59 +1127,418 @@ class NetworkScanner:
             print(f"{RED}[-] Invalid network: {e}")
             return []
 
-# ============== Integrated Modules ==============
+# ============== Protocol Module Scanner ==============
+class ProtocolModuleScanner:
+    """Stub implementation of protocol scanners.
+    Replace these methods with calls into the real modules in ./modules if present.
+    """
+
+    @staticmethod
+    def _print_result(name: str, result: Dict):
+        console.print(f"\n[bold cyan]--- {name} ---[/bold cyan]")
+        if isinstance(result, dict):
+            for key, value in result.items():
+                console.print(f"  [green]{key}:[/green] {value}")
+        else:
+            console.print(f"  {result}")
+
+    @staticmethod
+    def _tcp_probe(ip: str, port: int, timeout: float = 5.0) -> Dict:
+        result = {"ip": ip, "port": port, "state": "closed", "banner": None}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            if sock.connect_ex((ip, port)) == 0:
+                result["state"] = "open"
+                try:
+                    sock.settimeout(2.0)
+                    data = sock.recv(256)
+                    if data:
+                        result["banner"] = data.decode("utf-8", errors="ignore").strip()
+                except:
+                    pass
+            sock.close()
+        except socket.timeout:
+            result["state"] = "filtered"
+        except Exception as e:
+            result["state"] = "error"
+            result["error"] = str(e)
+        return result
+
+    @staticmethod
+    def run_smb(target: str):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = ProtocolModuleScanner._tcp_probe(ip, 445)
+        ProtocolModuleScanner._print_result("SMB Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_snmp(target: str):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = ProtocolModuleScanner._tcp_probe(ip, 161, timeout=3.0)
+        # SNMP is UDP, so do a quick UDP probe too
+        try:
+            usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            usock.settimeout(3.0)
+            probe = b"\x30\x00\x00\x00\x02\x01\x00\x04\x06public\xa0\x1f\x02\x01\x00\x02\x01\x00\x30\x14"
+            usock.sendto(probe, (ip, 161))
+            data, _ = usock.recvfrom(1024)
+            result["snmp_response"] = data.hex()[:100]
+            result["state"] = "open"
+            usock.close()
+        except socket.timeout:
+            result["snmp_response"] = None
+        except Exception as e:
+            result["snmp_error"] = str(e)
+        ProtocolModuleScanner._print_result("SNMP Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_ldap(target: str, port: int = 389):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = ProtocolModuleScanner._tcp_probe(ip, port)
+        ProtocolModuleScanner._print_result("LDAP Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_rdp(target: str):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = ProtocolModuleScanner._tcp_probe(ip, 3389)
+        ProtocolModuleScanner._print_result("RDP Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_smtp(target: str, port: int = 25, test_relay: bool = True):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = {"banner": None, "open_relay": None, "error": None}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, port))
+            banner = sock.recv(1024).decode("utf-8", errors="ignore").strip()
+            result["banner"] = banner
+            if test_relay:
+                sock.send(b"EHLO test.local\r\n")
+                sock.recv(1024)
+                sock.send(b"MAIL FROM:<test@test.local>\r\n")
+                resp = sock.recv(1024).decode("utf-8", errors="ignore")
+                sock.send(b"RCPT TO:<probe@example.com>\r\n")
+                resp2 = sock.recv(1024).decode("utf-8", errors="ignore")
+                result["open_relay"] = "250" in resp2
+            sock.send(b"QUIT\r\n")
+            sock.close()
+        except Exception as e:
+            result["error"] = str(e)
+        ProtocolModuleScanner._print_result("SMTP Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_dns_zone(domain: str):
+        result = {"domain": domain, "records": {}}
+        try:
+            import dns.resolver
+            import dns.zone
+            import dns.query
+            ns_answers = dns.resolver.resolve(domain, "NS")
+            for ns in ns_answers:
+                ns_str = str(ns).rstrip(".")
+                try:
+                    z = dns.zone.from_xfr(dns.query.xfr(ns_str, domain, timeout=5))
+                    result["records"][ns_str] = [str(n) for n in z.nodes.keys()]
+                except Exception as e:
+                    result["records"][ns_str] = f"Transfer failed: {e}"
+        except ImportError:
+            result["records"]["error"] = "dnspython not installed"
+        except Exception as e:
+            result["records"]["error"] = str(e)
+        ProtocolModuleScanner._print_result("DNS Zone Transfer", result)
+        return result
+
+    @staticmethod
+    def run_nfs(target: str):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = ProtocolModuleScanner._tcp_probe(ip, 2049)
+        ProtocolModuleScanner._print_result("NFS Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_vnc(target: str, port: int = 5900):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = ProtocolModuleScanner._tcp_probe(ip, port)
+        ProtocolModuleScanner._print_result("VNC Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_redis(target: str, port: int = 6379):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = {"ip": ip, "port": port}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, port))
+            sock.send(b"PING\r\n")
+            data = sock.recv(1024).decode("utf-8", errors="ignore").strip()
+            result["response"] = data
+            result["unauth"] = "PONG" in data
+            sock.close()
+        except Exception as e:
+            result["error"] = str(e)
+        ProtocolModuleScanner._print_result("Redis Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_mongodb(target: str, port: int = 27017):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = {"ip": ip, "port": port}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, port))
+            # Send a minimal ismaster command
+            sock.close()
+            result["state"] = "open"
+        except Exception as e:
+            result["error"] = str(e)
+        ProtocolModuleScanner._print_result("MongoDB Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_sip(target: str, port: int = 5060):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = {"ip": ip, "port": port, "state": "unknown"}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3.0)
+            sock.sendto(b"OPTIONS sip:test@" + ip.encode() + b" SIP/2.0\r\n\r\n", (ip, port))
+            data, _ = sock.recvfrom(1024)
+            result["state"] = "open"
+            result["response"] = data.decode("utf-8", errors="ignore").strip()[:200]
+            sock.close()
+        except socket.timeout:
+            result["state"] = "open|filtered"
+        except Exception as e:
+            result["error"] = str(e)
+        ProtocolModuleScanner._print_result("SIP Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_rtsp(target: str, port: int = 554):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        result = {"ip": ip, "port": port}
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((ip, port))
+            sock.send(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            data = sock.recv(1024).decode("utf-8", errors="ignore").strip()
+            result["response"] = data[:200]
+            result["state"] = "open"
+            sock.close()
+        except Exception as e:
+            result["error"] = str(e)
+        ProtocolModuleScanner._print_result("RTSP Enumerator", result)
+        return result
+
+    @staticmethod
+    def run_databases(target: str):
+        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
+        db_ports = {
+            "mysql": 3306,
+            "postgres": 5432,
+            "mssql": 1433,
+            "oracle": 1521,
+        }
+        results = {}
+        for db, port in db_ports.items():
+            results[db] = ProtocolModuleScanner._tcp_probe(ip, port, timeout=3.0)
+        for db_name, db_result in results.items():
+            ProtocolModuleScanner._print_result(db_name.upper(), db_result)
+        return results
+
+
+def run_protocol_modules():
+    """Interactive menu for protocol modules."""
+    console.print("\n[bold cyan]--- PROTOCOL ENUMERATION MODULES ---[/bold cyan]")
+    console.print("[bold green]1.[/bold green] SMB Enumerator")
+    console.print("[bold green]2.[/bold green] SNMP Enumerator")
+    console.print("[bold green]3.[/bold green] LDAP Enumerator")
+    console.print("[bold green]4.[/bold green] RDP Enumerator")
+    console.print("[bold green]5.[/bold green] SMTP Enumerator")
+    console.print("[bold green]6.[/bold green] DNS Zone Transfer")
+    console.print("[bold green]7.[/bold green] NFS Enumerator")
+    console.print("[bold green]8.[/bold green] VNC Enumerator")
+    console.print("[bold green]9.[/bold green] Redis Enumerator")
+    console.print("[bold green]10.[/bold green] MongoDB Enumerator")
+    console.print("[bold green]11.[/bold green] SIP Enumerator")
+    console.print("[bold green]12.[/bold green] RTSP Enumerator")
+    console.print("[bold green]13.[/bold green] Database Scan (MySQL/Postgres/MSSQL)")
+    console.print("[bold red]14.[/bold red] Back to main menu")
+
+    choice = hacker_input("Select module")
+
+    def _safe_int(prompt: str, default: int) -> int:
+        raw = hacker_input(prompt, str(default))
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        if choice == "1":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_smb(target)
+        elif choice == "2":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_snmp(target)
+        elif choice == "3":
+            target = hacker_input("Enter target IP/hostname")
+            port = _safe_int("Port (default 389)", 389)
+            if target:
+                ProtocolModuleScanner.run_ldap(target, port)
+        elif choice == "4":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_rdp(target)
+        elif choice == "5":
+            target = hacker_input("Enter target IP/hostname")
+            relay = Confirm.ask("Test open relay?", default=True)
+            if target:
+                ProtocolModuleScanner.run_smtp(target, test_relay=relay)
+        elif choice == "6":
+            domain = hacker_input("Enter domain (e.g., example.com)")
+            if domain:
+                ProtocolModuleScanner.run_dns_zone(domain)
+        elif choice == "7":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_nfs(target)
+        elif choice == "8":
+            target = hacker_input("Enter target IP/hostname")
+            port = _safe_int("Port (default 5900)", 5900)
+            if target:
+                ProtocolModuleScanner.run_vnc(target, port)
+        elif choice == "9":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_redis(target)
+        elif choice == "10":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_mongodb(target)
+        elif choice == "11":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_sip(target)
+        elif choice == "12":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_rtsp(target)
+        elif choice == "13":
+            target = hacker_input("Enter target IP/hostname")
+            if target:
+                ProtocolModuleScanner.run_databases(target)
+        elif choice == "14":
+            return
+        else:
+            console.print("[!] Invalid option.", style="red")
+    except Exception as e:
+        console.print(f"{RED}[!] Error: {e}{RESET}", style="red")
+
+
+# ============== Domain Scanner ==============
 class DomainScanner:
     """Integrates SpectraScan Domain Scanner features"""
+    @staticmethod
+    def _run_whois(target: str) -> str:
+        """Run whois against target. Works on any platform that has whois installed."""
+        try:
+            result = subprocess.run(
+                ["whois", target],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return result.stdout if result.returncode == 0 else (result.stderr or "whois failed")
+        except FileNotFoundError:
+            # Try a public WHOIS API as a fallback
+            try:
+                curl = subprocess.run(
+                    ["curl", "-s", f"https://api.hackertarget.com/whois/?q={target}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if curl.returncode == 0 and curl.stdout:
+                    return curl.stdout
+            except FileNotFoundError:
+                pass
+            return "[-] 'whois' not installed. Install it (Linux: apt/yum, macOS: brew, Windows: use WSL or 'whois' from sysinternals)."
+        except Exception as e:
+            return f"whois error: {e}"
+
     @staticmethod
     def scan(domain: str, report_manager: ReportManager):
         report_manager.write(f"\n-----DOMAIN SCAN OF {domain}-----\n\n[*] ADMIN INFO \n-------------------------------------------------------------------------------")
 
-        # Spectra
-        report_manager.write("\n[*] ADMIN INFO ")
-        try:
-            # Try 'Spectra' first, then fall back if needed
-            result = subprocess.run(["Spectra", domain], capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                report_manager.write(result.stdout)
-            else:
-                report_manager.write(f"[-] Spectra command failed: {result.stderr}")
-        except FileNotFoundError:
-            report_manager.write("[-] 'Spectra' command not found. Install Git Bash and run 'pacman -S whois' in Git Bash.")
-        except Exception as e:
-            report_manager.write(f"Error running Spectra: {e}")
+        # Whois
+        report_manager.write("\n[*] WHOIS (ADMIN INFO) ")
+        report_manager.write(DomainScanner._run_whois(domain))
 
         report_manager.write("\n[*] DNS LOOKUP\n-------------------------------------------------------------------------------")
 
         # DNS Lookup via API (Fallback if curl fails)
         try:
-            result = subprocess.run(["curl", "-s", f"https://api.hackertarget.com/dnslookup/?q={domain}"], capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
+            result = subprocess.run(
+                ["curl", "-s", f"https://api.hackertarget.com/dnslookup/?q={domain}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0 and result.stdout:
                 report_manager.write(result.stdout)
             else:
-                # Fallback to nslookup (Windows built-in)
-                report_manager.write("[*] Falling back to nslookup (Windows built-in tool)\n")
-                result = subprocess.run(["nslookup", domain], capture_output=True, text=True, timeout=10)
-                report_manager.write(result.stdout)
+                report_manager.write("[*] Falling back to nslookup (built-in tool)\n")
+                ns = subprocess.run(
+                    ["nslookup", domain],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                report_manager.write(ns.stdout)
         except FileNotFoundError:
             report_manager.write("[-] 'curl' not found. Using nslookup fallback.\n")
             try:
-                result = subprocess.run(["nslookup", domain], capture_output=True, text=True, timeout=10)
-                report_manager.write(result.stdout)
+                ns = subprocess.run(
+                    ["nslookup", domain],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                report_manager.write(ns.stdout)
             except Exception as e:
                 report_manager.write(f"Error with nslookup: {e}")
         except Exception as e:
             report_manager.write(f"Error with DNS lookup API: {e}")
 
-        # Host command (Replaced with nslookup for Windows compatibility)
-        report_manager.write("\n[*] NSLOOKUP (Windows Equivalent of 'host')\n-------------------------------------------------------------------------------")
+        report_manager.write("\n[*] NSLOOKUP\n-------------------------------------------------------------------------------")
         try:
-            result = subprocess.run(["nslookup", domain], capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                ["nslookup", domain],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
             report_manager.write(result.stdout)
+        except FileNotFoundError:
+            report_manager.write("[-] 'nslookup' not available on this platform.")
         except Exception as e:
             report_manager.write(f"Error running nslookup: {e}")
 
         report_manager.write("-------------------------------------------------------------------------------\n[*] DONE")
 
+# ============== IP Scanner ==============
 class IPScanner:
     """Integrates SpectraScan IP Scanner features"""
     @staticmethod
@@ -1070,33 +1548,49 @@ class IPScanner:
         # GeoIP
         report_manager.write("[*] LOCALISATION")
         try:
-            result = subprocess.run(["curl", "-s", f"https://api.hackertarget.com/geoip/?q={ip}"], capture_output=True, text=True)
+            result = subprocess.run(
+                ["curl", "-s", f"https://api.hackertarget.com/geoip/?q={ip}"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
             report_manager.write(result.stdout)
+        except FileNotFoundError:
+            report_manager.write("[-] 'curl' not found.")
         except Exception as e:
             report_manager.write(f"Error with GeoIP: {e}")
+
         # WHOIS
-        report_manager.write("\n[*] ADMIN INFO")
-        try:
-            result = subprocess.run(["Spectra", ip], capture_output=True, text=True)
-            report_manager.write(result.stdout)
-        except Exception as e:
-            report_manager.write(f"Error running Spectra: {e}")
-        # Shodan    
+        report_manager.write("\n[*] ADMIN INFO (WHOIS)")
+        report_manager.write(DomainScanner._run_whois(ip))
+
+        # Shodan
         report_manager.write("\n[*] SHODAN RESULTS")
-        try:
-            import shodan
-            api = shodan.Shodan("mWFf82jgCVnFpkl9s1Y9Q4dQTNAam7w5")  # Replace with your actual API key
-            result = api.host(ip)
-            report_manager.write(f"Open Ports: {len(result.get('ports', []))}")
-            for port in result.get('ports', []):
-                report_manager.write(f"  Port {port}: {result.get('data', [{}]).get('product', 'Unknown')}")
-        except ImportError:
-            report_manager.write("Shodan Python library not found. Install with: pip install shodan")
-        except Exception as e:
-            report_manager.write(f"Error with Shodan: {e}")
+        api_key = os.environ.get("SHODAN_API_KEY")
+        if not api_key:
+            report_manager.write("[-] SHODAN_API_KEY environment variable not set. Skipping Shodan lookup.")
+        else:
+            try:
+                import shodan
+                api = shodan.Shodan(api_key)
+                result = api.host(ip)
+                ports = result.get("ports", [])
+                report_manager.write(f"Open Ports: {len(ports)}")
+                for port in ports:
+                    banner = ""
+                    for entry in result.get("data", []):
+                        if entry.get("port") == port:
+                            banner = entry.get("product", "Unknown")
+                            break
+                    report_manager.write(f"  Port {port}: {banner}")
+            except ImportError:
+                report_manager.write("[-] Shodan Python library not found. Install with: pip install shodan")
+            except Exception as e:
+                report_manager.write(f"Error with Shodan: {e}")
 
         report_manager.write("\n[*] DONE")
 
+# ============== Phone Scanner ==============
 class PhoneScanner:
     """Integrates SpectraScan Phone Scanner features"""
     @staticmethod
@@ -1110,64 +1604,98 @@ class PhoneScanner:
         script_path = os.path.join(os.path.dirname(__file__), "modules", "phone_scanner.py")
         if os.path.exists(script_path):
             try:
-                result = subprocess.run(["python3", script_path, phone], capture_output=True, text=True)
+                result = subprocess.run(
+                    ["python3", script_path, phone],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
                 report_manager.write(result.stdout)
                 if result.stderr:
                     report_manager.write(f"Stderr: {result.stderr}")
             except Exception as e:
                 report_manager.write(f"Error running phone scanner: {e}")
         else:
-            report_manager.write("Phone scanner module not found.")
+            report_manager.write("Phone scanner module not found (modules/phone_scanner.py).")
 
         report_manager.write("\n[*] DONE")
 
+# ============== Email Scanner ==============
 class EmailScanner:
     """Integrates SpectraScan Email Scanner features"""
     @staticmethod
     def scan(email: str, report_manager: ReportManager):
         report_manager.write(f"\n[*] Gathering informations for {email}...")
         try:
-            result = subprocess.run(["curl", "-s", f"https://emailrep.io/{email}"], capture_output=True, text=True)
-            json_data = json.loads(result.stdout)
+            headers = {"User-Agent": "SpectraScan/1.0"}
+            try:
+                result = subprocess.run(
+                    ["curl", "-s", "-H", f"User-Agent: {headers['User-Agent']}",
+                     f"https://emailrep.io/{email}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                payload = result.stdout
+            except FileNotFoundError:
+                req = Request(f"https://emailrep.io/{email}", headers=headers)
+                with urlopen(req, timeout=10) as resp:
+                    payload = resp.read().decode("utf-8", errors="ignore")
 
-            report_manager.write(f"\n_____FULL REPORT_____")
+            json_data = json.loads(payload) if payload else {}
+
+            details = json_data.get("details", {}) or {}
+            report_manager.write("\n_____FULL REPORT_____")
             report_manager.write(f"-Email: {email}")
             report_manager.write(f"-Suspicious: {json_data.get('suspicious')}")
             report_manager.write(f"-Reputation: {json_data.get('reputation')}")
-            report_manager.write(f"-Blacklisted: {json_data.get('details', {}).get('blacklisted')}")
-            report_manager.write(f"-Malicious Activity: {json_data.get('details', {}).get('malicious_activity')}")
-            report_manager.write(f"-Data Breach: {json_data.get('details', {}).get('data_breach')}")
-            report_manager.write(f"-First Seen: {json_data.get('details', {}).get('first_seen')}")
-            report_manager.write(f"-Last Seen: {json_data.get('details', {}).get('last_seen')}")
-            report_manager.write(f"-Domain Exists: {json_data.get('details', {}).get('domain_exists')}")
-            report_manager.write(f"-Free Provider: {json_data.get('details', {}).get('free_provider')}")
-            report_manager.write(f"-Disposable: {json_data.get('details', {}).get('disposable')}")
-            report_manager.write(f"-Deliverable: {json_data.get('details', {}).get('deliverable')}")
-            report_manager.write(f"-Spoofable: {json_data.get('details', {}).get('spoofable')}")
-
+            report_manager.write(f"-Blacklisted: {details.get('blacklisted')}")
+            report_manager.write(f"-Malicious Activity: {details.get('malicious_activity')}")
+            report_manager.write(f"-Data Breach: {details.get('data_breach')}")
+            report_manager.write(f"-First Seen: {details.get('first_seen')}")
+            report_manager.write(f"-Last Seen: {details.get('last_seen')}")
+            report_manager.write(f"-Domain Exists: {details.get('domain_exists')}")
+            report_manager.write(f"-Free Provider: {details.get('free_provider')}")
+            report_manager.write(f"-Disposable: {details.get('disposable')}")
+            report_manager.write(f"-Deliverable: {details.get('deliverable')}")
+            report_manager.write(f"-Spoofable: {details.get('spoofable')}")
         except Exception as e:
             report_manager.write(f"Error scraping emailrep: {e}")
         report_manager.write("\n[*] DONE")
 
+# ============== Image Scanner ==============
 class ImageScanner:
     """Integrates SpectraScan Image EXIF Scanner features"""
     @staticmethod
     def scan(image_path: str, report_manager: ReportManager):
         report_manager.write(f"\nEXIF data from: {image_path}")
+        if not os.path.exists(image_path):
+            report_manager.write(f"[-] File not found: {image_path}")
+            report_manager.write("\n[*] DONE")
+            return
         try:
             # Try exiv2 first, then exiftool
-            if os.path.exists("/usr/bin/exiv2"):
-                result = subprocess.run(["exiv2", image_path], capture_output=True, text=True)
+            exiv2_path = "/usr/bin/exiv2" if sys.platform != "win32" else r"C:\Program Files\exiv2\exiv2.exe"
+            exiftool_path = "/usr/bin/exiftool" if sys.platform != "win32" else r"C:\Windows\exiftool.exe"
+            if os.path.exists(exiv2_path):
+                result = subprocess.run(
+                    ["exiv2", image_path], capture_output=True, text=True, timeout=30
+                )
                 report_manager.write(result.stdout)
-            elif os.path.exists("/usr/bin/exiftool"):
-                result = subprocess.run(["exiftool", image_path], capture_output=True, text=True)
+            elif os.path.exists(exiftool_path):
+                result = subprocess.run(
+                    ["exiftool", image_path], capture_output=True, text=True, timeout=30
+                )
                 report_manager.write(result.stdout)
             else:
                 report_manager.write("No EXIF tool found (exiv2 or exiftool required).")
+        except FileNotFoundError:
+            report_manager.write("No EXIF tool found (exiv2 or exiftool required).")
         except Exception as e:
             report_manager.write(f"Error reading EXIF: {e}")
         report_manager.write("\n[*] DONE")
 
+# ============== Link Scanner ==============
 class LinkScanner:
     """Integrates SpectraScann Link Sniffing features"""
     @staticmethod
@@ -1176,20 +1704,27 @@ class LinkScanner:
         report_manager.write(f"[*] SNIFFING LINKS for {domain}")
         report_manager.write("-------------------------------------------------------------------------------")
         try:
-            result = subprocess.run(["curl", "-s", f"https://api.hackertarget.com/pagelinks/?q={domain}"], capture_output=True, text=True)
-            report_manager.write(result.stdout)
+            result = subprocess.run(
+                ["curl", "-s", f"https://api.hackertarget.com/pagelinks/?q={domain}"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            report_manager.write(result.stdout or "[-] No response from API.")
+        except FileNotFoundError:
+            report_manager.write("[-] 'curl' not found.")
         except Exception as e:
             report_manager.write(f"Error with link sniffing: {e}")
         report_manager.write("\n[*] DONE")
 
+# ============== Criminal Scanner ==============
 class CriminalScanner:
     """Integrates SpectraScan Criminal Scanner features"""
     @staticmethod
     def scan(first_name: str, last_name: str, state: str, city: str, report_manager: ReportManager):
-        if state:
-            state = f"{state}."
-        link = f"https://{state}staterecords.org/search.php?firstname={first_name}&lastname={last_name}&city={city}"
-        report_manager.write(f"\n[*] Generating Link...")
+        state_prefix = f"{state}." if state else ""
+        link = f"https://{state_prefix}staterecords.org/search.php?firstname={first_name}&lastname={last_name}&city={city}"
+        report_manager.write("\n[*] Generating Link...")
         report_manager.write(f"\n\nCTRL + click on this link to get your report: [{link}]")
         report_manager.write("\n[*] DONE")
 
@@ -1234,7 +1769,9 @@ def run_port_scan_cli():
         ports = list(COMMON_PORTS.keys())
     else:
         try:
-            ports = [int(p.strip()) for p in ports_input.split(",")]
+            ports = [int(p.strip()) for p in ports_input.split(",") if p.strip().isdigit()]
+            if not ports:
+                raise ValueError("no valid ports")
         except ValueError:
             console.print("[!] Invalid port format. Returning to menu.", style="red")
             return
@@ -1335,7 +1872,6 @@ def main():
         args, _ = parser.parse_known_args()
         
         if args.target:
-            # Fallback to old style if args are provided
             scanner = PortScanner(args.target)
             scanner.initialize()
             scanner.scan()
@@ -1348,7 +1884,8 @@ def main():
     while True:
         console.print("\n[bold green]1.[/bold green] Port Scanner")
         console.print("[bold green]2.[/bold green] Advanced Modules (Domain/IP/Email/etc)")
-        console.print("[bold red]3.[/bold red] Exit")
+        console.print("[bold magenta]3.[/bold magenta] Protocol Modules (SMB/SNMP/LDAP/RDP/etc)")
+        console.print("[bold red]4.[/bold red] Exit")
         
         choice = input(f"{CYAN}root@spectra:~#{RESET} Select Option: ").strip()
         
@@ -1357,10 +1894,13 @@ def main():
         elif choice == "2":
             run_other_scanners()
         elif choice == "3":
+            run_protocol_modules()
+        elif choice == "4":
             console.print("[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
             break
         else:
             console.print("[!] Invalid Option. Please try again.", style="red")
+
 
 if __name__ == "__main__":
     main()
