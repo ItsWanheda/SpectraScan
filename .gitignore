@@ -1,26 +1,45 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Virtual Environment
+*.so
+.Python
 venv/
 env/
+.venv/
 ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Reports (user-generated, do NOT commit)
+*.csv
+*.html
+*.log
+reports/
+output/
+
+# API keys & secrets
+.env
+*.env
+secrets.yaml
+config.local.yaml
+shodan_key.txt
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Reports
-*.html
-*.csv
-*.json
-report_*.json
-report_*.html
+# OS / runtime
+*.pid
+*.lock
+.coverage
+htmlcov/
