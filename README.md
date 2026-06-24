@@ -47,6 +47,22 @@ Designed for security professionals, pentesters, and network administrators who 
 - **💾 Persistence** — Save and append scan results to local storage at `~/.local/share/SpectraScan/`
 - **📂 History Management** — Read or delete stored reports from the CLI.
 
+### 🔬 Protocol Enumeration Modules
+*Deep, protocol-aware inspection of exposed services — pure Python, no external libraries required.*
+
+- **🔐 SMB/CIFS** — SMBv1/v2/v3 negotiation, share enumeration, anonymous auth detection, OS fingerprinting, EternalBlue flag.
+- **📡 SNMP** — Custom BER encoder, default-community brute-force (`public`, `private`, `cisco`, …), system-info queries, `snmpwalk` fallback.
+- **📂 LDAP / LDAPS** — Anonymous-bind detection, root DSE retrieval, user/group enumeration via `ldapsearch`.
+- **🖥️ RDP** — X.224/TPKT handshake, NLA detection, BlueKeep (CVE-2019-0708) heuristic.
+- **✉️ SMTP** — Banner grab, VRFY user enumeration, open-relay test, STARTTLS support.
+- **🌐 DNS Zone Transfer** — AXFR attempts against all NS records; reports servers that allow transfer.
+- **📁 NFS** — RPC portmapper dump, MOUNTD EXPORT call, `showmount` fallback; flags permissive exports.
+- **🖼️ VNC** — RFB handshake, auth-type enumeration, no-authentication detection.
+- **🗄️ Redis** — RESP protocol, INFO/DBSIZE/RANDOMKEY sampling, unauthenticated-access flag.
+- **🍃 MongoDB** — Custom OP_MSG wire protocol, hand-rolled BSON encoder/parser, unauthenticated-access flag.
+- **📞 SIP** — UDP OPTIONS probe with response capture.
+- **🎥 RTSP** — DESCRIBE across common stream paths, SDP capture, unauthenticated-stream detection.
+- **🗃️ Databases** — Hand-rolled MySQL/PostgreSQL/MSSQL clients with version detection.
 ---
 
 ## 🚀 Usage
@@ -156,6 +172,12 @@ python SpectraScan.py
 
 ## 🧭 CLI Menu
 **The interactive CLI provides:**
+```text
+1. **Port Scanner**
+2. **Advanced Modules** (Domain/IP/Email/etc)
+3. **Protocol Modules** (SMB/SNMP/LDAP/RDP/SMTP/DNS/NFS/VNC/Redis/MongoDB/SIP/RTSP/Databases)
+4. **EXIT**
+```
 
 1. **Port Scanner**
 * Target IP/Hostname
@@ -176,10 +198,26 @@ python SpectraScan.py
 SpectraScan/
 ├── SpectraScan.py
 ├── modules/
+modules/
 │   ├── brute_forcer.py
 │   ├── vuln_scanner.py
 │   ├── web_enumerator.py
-│   └── phone_Locator.py
+│   ├── phone_scanner.py
+│   ├── __init__.py
+│   ├── smb_enum.py
+│   ├── snmp_enum.py
+│   ├── ldap_enum.py
+│   ├── rdp_enum.py
+│   ├── smtp_enum.py
+│   ├── dns_zone.py
+│   ├── nfs_enum.py
+│   ├── vnc_enum.py
+│   ├── redis_enum.py
+│   ├── mongodb_enum.py
+│   ├── sip_enum.py
+│   ├── rtsp_enum.py
+│   ├── database_enum.py
+│   └── network_services.py
 ├── CHANGELOG.md
 ├── README.md
 └── requirements.txt
