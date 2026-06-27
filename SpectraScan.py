@@ -1372,7 +1372,8 @@ def run_protocol_modules():
     console.print("[bold green]11.[/bold green] SIP Enumerator")
     console.print("[bold green]12.[/bold green] RTSP Enumerator")
     console.print("[bold green]13.[/bold green] Database Scan (MySQL/Postgres/MSSQL)")
-    console.print("[bold red]14.[/bold red] Back to main menu")
+    console.print("[bold blue]14.[/bold blue] Dark Web Recon")
+    console.print("[bold red]15.[/bold red] Back to main menu")
 
     choice = hacker_input("Select module")
 
@@ -1440,6 +1441,25 @@ def run_protocol_modules():
             if target:
                 ProtocolModuleScanner.run_databases(target)
         elif choice == "14":
+            # ---- Dark Web Recon ----
+            try:
+                from modules.darkweb import run_darkweb_menu, SOCKS_AVAILABLE
+            except ImportError as e:
+                console.print(f"[!] Cannot load darkweb module: {e}",
+                              style="red")
+                return
+            if not SOCKS_AVAILABLE:
+                console.print(
+                    "[!] 'pysocks' not installed. .onion ops will be disabled.",
+                    style="yellow")
+                console.print(
+                    "    Install with: pip install pysocks", style="yellow")
+            console.print(
+                "[*] Tor required for .onion ops (127.0.0.1:9050). "
+                "Clearnet APIs work without Tor.",
+                style="cyan")
+            run_darkweb_menu()
+        elif choice == "15":
             return
         else:
             console.print("[!] Invalid option.", style="red")
