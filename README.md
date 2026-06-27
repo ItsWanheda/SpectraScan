@@ -183,7 +183,7 @@ T5	     Insane	       Maximum speed, maximum noise
 **Setup**
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/SpectraScan.git
+git clone https://github.com/ItsWanheda/SpectraScan.git
 cd SpectraScan
 
 # Create and activate a virtual environment
