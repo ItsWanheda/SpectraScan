@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 ---
 ## [Unreleased]
 
+### 🚀 Added — Dark Web Recon Module
+
+A brand-new **Dark Web Recon** layer has been integrated as a strictly passive, ethical reconnaissance module.
+
+> **Ethical policy:** no marketplace interaction, no payload execution, no illegal content, hard timeouts on every network call, no auto-Tor-launch. Clearnet checks work without Tor; only `.onion` operations require it.
+
+**New file:** `modules/darkweb.py`
+
+| Feature | Source / API | Auth required |
+|---|---|---|
+| `.onion` v2 / v3 resolve + HTTP banner | Tor SOCKS5 (`127.0.0.1:9050`) via `pysocks` | local Tor |
+| Ahmia search (`.onion` results for a keyword) | `https://ahmia.fi/api/v1/search` | none |
+| PGP public-key lookup by email or name | `https://keys.openpgp.org/vks/v1/...` | none |
+| Email / domain leak & reputation | `https://emailrep.io/` | none |
+| BTC address report (balance, tx count, totals) | `https://blockchain.info/rawaddr/` | none |
+| Structured JSON report | local file | — |
+
+**Module design highlights:**
+- Single class `DarkWebScanner` — easy to import as a library.
+- Hard-coded timeouts (HTTP: 15s, `.onion`: 12s, BTC: 10s) prevent runaway connections.
+- Auto-saves results to `~/.local/share/SpectraScan/SS-darkweb-<target>-<timestamp>.json`.
+- Auto-detects whether the target is a BTC address, `.onion`, or generic keyword and pre-selects the appropriate menu item.
+- "Run ALL passive checks" option batches every check that applies to the current target.
+
+**CLI integration:**
+- New entry `14. Dark Web Recon` inside `run_protocol_modules()` (option 3 of the main menu).
+- Old `Back to main menu` entry shifted from `14` → `15`.
+- Graceful degradation: if `pysocks` is missing, the module warns and disables only the `.onion` checks; everything else keeps working.
+- Import errors are caught by the existing `try/except` in the dispatch block, so a missing module cannot abort the rest of the CLI.
+
+### 📦 Dependencies
+
+- **Added (optional):** `pysocks` — required only for `.onion` resolve + hidden-service banner. The module continues to function without it.
+- `requirements.txt` updated with a documented `pysocks` entry and an explanatory comment block.
+
+### 🧹 Changed
+
+- `run_protocol_modules()` menu header updated to show options `1–15` (added `14. Dark Web Recon`, renumbered back-button to `15`).
+- `run_protocol_modules()` dispatch block updated with the new `elif choice == "14"` branch and shifted back-button check to `"15"`.
+
+### 📝 Documentation
+
+- New "🌑 Dark Web Recon Module" section in `README.md` (features, ethical notes, requirements).
+- New "🔹 Dark Web Recon" usage section in `README.md` explaining the in-menu workflow.
+- Updated `🧭 CLI Menu` table to list `Dark Web Recon` under Protocol Modules.
+- Updated `🧩 Project Structure` to include `modules/darkweb.py`.
+- Updated `📦 Installation` with `pysocks` install line and Tor notes.
+- Updated `🛡️ Security Notes` and `⚠️ Disclaimer` to cover the dark-web functionality.
+
+### 📂 Files
+
+**New:**
+- `modules/darkweb.py`
+
+**Modified:**
+- `SpectraScan.py` (menu header + dispatch block only)
+- `README.md`
+- `CHANGELOG.md`
+- `requirements.txt`
+
+---
+
+## [released]
+
+---
+
 ## [2.1.0] - 2026-06-24
 
 ### 🚀 Added
