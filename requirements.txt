@@ -1,5 +1,5 @@
-# No external dependencies required for the core functionality
-# This file is kept for future extensions (e.g., dnspython for advanced DNS)
+# SpectraScan dependencies
+# Core
 dnspython
 colorama
 prettytable
@@ -11,3 +11,8 @@ fpdf
 pyyaml
 rich>=13.0
 impacket>=0.10.0
+
+# Dark Web Recon Module (modules/darkweb.py)
+# Needed for .onion resolve + hidden service banner via Tor SOCKS5.
+# Clearnet features (Ahmia/PGP/BTC/emailrep) still work without it.
+pysocks
