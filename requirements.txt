@@ -1,5 +1,4 @@
 # SpectraScan dependencies
-# Core
 dnspython
 colorama
 prettytable
