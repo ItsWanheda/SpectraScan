@@ -757,7 +757,6 @@ The developers of SpectraScan are **not responsible for any misuse** of this too
 ---
 
 ## 📜 License
-<<<<<<< HEAD
 
 This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
 
@@ -794,6 +793,4 @@ SOFTWARE.
 Made with ❤️ by the ItsWanheda & An0nym0us
 
 </div>
-=======
-This project is licensed under the MIT License - see the (LICENSE) file for details.
->>>>>>> 9a0f3efa0f03d410da0b710c11acbbcb4c92d941
+
