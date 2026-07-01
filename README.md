@@ -418,10 +418,10 @@ python SpectraScan.py -r
 # Export a one-shot scan to HTML
 python SpectraScan.py -t target.com -o report.html -f html
 
-<<<<<<< HEAD
+
 # JSON output for piping into other tools
 python SpectraScan.py -t target.com -o report.json -f json
-=======
+
 ---
 
 ## ⚙️ Configuration
