@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🕵️‍♂️ SpectraScangit add README.md
+# 🕵️‍♂️ SpectraScan
 
 ### *Advanced Network Reconnaissance, Port Scanning & OSINT Intelligence Framework*
 
