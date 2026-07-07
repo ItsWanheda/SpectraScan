@@ -472,7 +472,6 @@ pip install pysocks
 ```bash
 pip install rich
 python SpectraScan.py
->>>>>>> 9a0f3efa0f03d410da0b710c11acbbcb4c92d941
 ```
 
 ---
