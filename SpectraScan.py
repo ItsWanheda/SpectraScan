@@ -21,6 +21,7 @@ import re
 import csv
 import ipaddress
 import html
+from functools import wraps
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from urllib.request import urlopen, Request
@@ -1760,46 +1761,99 @@ def print_banner():
     console.print("[*] Initializing SpectraScan Core...", style="green")
     time.sleep(0.5)
     console.print("[+] Core Loaded. Awaiting Input.\n", style="green")
-
+ 
+ 
+def guard_interrupt(fn):
+    """Decorator: catch Ctrl+C / Ctrl+D inside a submenu and bounce
+    back to the caller instead of killing the whole program."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[!] Cancelled. Returning to previous menu.", style="yellow")
+            return None
+    return wrapper
+ 
+ 
 def hacker_input(prompt_text: str, default: str = "") -> str:
     """Simulates a terminal input with nice formatting"""
     if default:
         prompt = f"{CYAN}root@spectra:~#{RESET} {prompt_text} [{default}]: "
     else:
         prompt = f"{CYAN}root@spectra:~#{RESET} {prompt_text}: "
-    
+ 
     user_input = input(prompt).strip()
     return user_input if user_input else default
-
+ 
+ 
+def parse_ports(ports_input: str):
+    """Turn a ports string into a list[int], or None if invalid.
+    Supports comma lists, ranges (80-100), 'all', and 'common'."""
+    ports_input = ports_input.lower().strip()
+ 
+    if ports_input == "all":
+        return list(range(1, 65536))
+    if ports_input == "common":
+        return list(COMMON_PORTS.keys())
+ 
+    ports = set()
+    try:
+        for chunk in ports_input.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "-" in chunk:
+                start, end = chunk.split("-", 1)
+                start, end = int(start), int(end)
+                if not (1 <= start <= end <= 65535):
+                    raise ValueError
+                ports.update(range(start, end + 1))
+            else:
+                p = int(chunk)
+                if not (1 <= p <= 65535):
+                    raise ValueError
+                ports.add(p)
+    except ValueError:
+        return None
+ 
+    return sorted(ports) if ports else None
+ 
+ 
+@guard_interrupt
 def run_port_scan_cli():
     """Interactive Port Scan Menu"""
     console.print("\n[bold cyan]--- PORT SCANNER MODULE ---[/bold cyan]")
+ 
     target = hacker_input("Enter Target IP or Hostname")
     if not target:
         console.print("[!] Target required. Returning to menu.", style="red")
         return
-
+ 
     scan_type = Prompt.ask("Scan Type", choices=["tcp", "syn", "udp"], default="tcp")
     timing = Prompt.ask("Timing Profile", choices=["T0", "T1", "T2", "T3", "T4", "T5"], default="T3")
-    
-    ports_input = hacker_input("Enter Ports (comma-separated, e.g., 80,443,8080) or 'all' for full scan", "common")
-    if ports_input.lower() == "all":
-        ports = list(range(1, 65536))
-    elif ports_input.lower() == "common":
-        ports = list(COMMON_PORTS.keys())
-    else:
-        try:
-            ports = [int(p.strip()) for p in ports_input.split(",") if p.strip().isdigit()]
-            if not ports:
-                raise ValueError("no valid ports")
-        except ValueError:
-            console.print("[!] Invalid port format. Returning to menu.", style="red")
+ 
+    ports_input = hacker_input(
+        "Enter Ports (e.g. 80,443,8080 or 1-1024), 'common', or 'all'", "common"
+    )
+    ports = parse_ports(ports_input)
+    if ports is None:
+        console.print("[!] Invalid port format. Returning to menu.", style="red")
+        return
+ 
+    if len(ports) > 5000:
+        proceed = Confirm.ask(
+            f"[!] {len(ports)} ports selected — this may take a while. Continue?",
+            default=True,
+        )
+        if not proceed:
+            console.print("[*] Scan cancelled.", style="yellow")
             return
-
+ 
     check_vulns = Confirm.ask("Check for Vulnerabilities?", default=False)
-    
-    console.print(f"\n[+]Spectra Starting Scan on {target}...", style="bold yellow")
-    
+ 
+    console.print(f"\n[+] Spectra Starting Scan on {target}...", style="bold yellow")
+ 
     kwargs = {
         "timeout": 1.0,
         "threads": 50,
@@ -1810,117 +1864,153 @@ def run_port_scan_cli():
         "check_vulns": check_vulns,
         "rate_limit": 0,
     }
-    
-    scanner = PortScanner(target, **kwargs)
-    scanner.initialize()
-    scanner.scan()
+ 
+    try:
+        scanner = PortScanner(target, **kwargs)
+        scanner.initialize()
+        scanner.scan()
+    except KeyboardInterrupt:
+        console.print("\n[!] Scan interrupted by user.", style="yellow")
+        return
+    except Exception as e:
+        console.print(f"[!] Scan failed: {e}", style="bold red")
+        return
+ 
     scanner.print_summary()
-    
-    # Export options
+ 
     if scanner.results:
         export = Confirm.ask("Export Results?", default=True)
         if export:
             fmt = Prompt.ask("Format", choices=["json", "html", "csv"], default="json")
             filename = hacker_input("Filename (without extension)", "scan_report")
+            # Basic sanitization to avoid accidental path traversal / weird chars
+            filename = "".join(c for c in filename if c.isalnum() or c in ("_", "-")) or "scan_report"
             full_path = f"{filename}.{fmt}"
-            if fmt == "json":
-                scanner.export_json(full_path)
-            elif fmt == "html":
-                scanner.export_html(full_path)
-            elif fmt == "csv":
-                scanner.export_csv(full_path)
-
+ 
+            try:
+                if fmt == "json":
+                    scanner.export_json(full_path)
+                elif fmt == "html":
+                    scanner.export_html(full_path)
+                elif fmt == "csv":
+                    scanner.export_csv(full_path)
+                console.print(f"[+] Results exported to {full_path}", style="green")
+            except Exception as e:
+                console.print(f"[!] Export failed: {e}", style="bold red")
+    else:
+        console.print("[*] No results to export.", style="yellow")
+ 
+ 
+@guard_interrupt
 def run_other_scanners():
     """Interactive menu for Domain, IP, Email, etc."""
     console.print("\n[bold cyan]--- ADVANCED MODULES ---[/bold cyan]")
     mode = Prompt.ask("Select Module", choices=[
         "domain", "ip", "phone", "email", "image", "link", "criminal", "reports"
     ])
-    
-    if mode == "domain":
-        domain = hacker_input("Enter Domain")
-        if domain:
-            DomainScanner.scan(domain, ReportManager())
-            
-    elif mode == "ip":
-        ip = hacker_input("Enter IP Address")
-        if ip:
-            IPScanner.scan(ip, ReportManager())
-            
-    elif mode == "phone":
-        phone = hacker_input("Enter Phone Number")
-        if phone:
-            PhoneScanner.scan(phone, ReportManager())
-            
-    elif mode == "email":
-        email = hacker_input("Enter Email Address")
-        if email:
-            EmailScanner.scan(email, ReportManager())
-            
-    elif mode == "image":
-        path = hacker_input("Enter Image Path")
-        if path:
-            ImageScanner.scan(path, ReportManager())
-            
-    elif mode == "link":
-        domain = hacker_input("Enter Domain for Link Sniffing")
-        if domain:
-            LinkScanner.scan(domain, ReportManager())
-            
+ 
+    rm = ReportManager()
+ 
+    module_map = {
+        "domain": ("Enter Domain", DomainScanner),
+        "ip": ("Enter IP Address", IPScanner),
+        "phone": ("Enter Phone Number", PhoneScanner),
+        "email": ("Enter Email Address", EmailScanner),
+        "image": ("Enter Image Path", ImageScanner),
+        "link": ("Enter Domain for Link Sniffing", LinkScanner),
+    }
+ 
+    if mode in module_map:
+        prompt_text, scanner_cls = module_map[mode]
+        value = hacker_input(prompt_text)
+        if not value:
+            console.print("[!] Input required. Returning to menu.", style="red")
+            return
+        try:
+            scanner_cls.scan(value, rm)
+        except Exception as e:
+            console.print(f"[!] {mode.capitalize()} scan failed: {e}", style="bold red")
+ 
     elif mode == "criminal":
         first = hacker_input("First Name")
         last = hacker_input("Last Name")
+        if not first or not last:
+            console.print("[!] First and last name are required.", style="red")
+            return
         state = hacker_input("State (Optional)")
         city = hacker_input("City")
-        CriminalScanner.scan(first, last, state, city, ReportManager())
-        
+        try:
+            CriminalScanner.scan(first, last, state, city, rm)
+        except Exception as e:
+            console.print(f"[!] Criminal lookup failed: {e}", style="bold red")
+ 
     elif mode == "reports":
         action = Prompt.ask("Action", choices=["read", "delete"])
-        rm = ReportManager()
-        if action == "read":
-            rm.read_report()
-        elif action == "delete":
-            rm.delete_report()
-
+        try:
+            if action == "read":
+                rm.read_report()
+            elif action == "delete":
+                if Confirm.ask("Are you sure you want to delete a report?", default=False):
+                    rm.delete_report()
+                else:
+                    console.print("[*] Delete cancelled.", style="yellow")
+        except Exception as e:
+            console.print(f"[!] Report action failed: {e}", style="bold red")
+ 
+ 
+MENU_ACTIONS = {
+    "1": ("Port Scanner", run_port_scan_cli),
+    "2": ("Advanced Modules (Domain/IP/Email/etc)", run_other_scanners),
+    "3": ("Protocol Modules (SMB/SNMP/LDAP/RDP/etc)", lambda: run_protocol_modules()),
+}
+ 
+ 
+def print_main_menu():
+    console.print("\n[bold]MAIN MENU[/bold]")
+    for key, (label, _) in MENU_ACTIONS.items():
+        style = "bold green" if key in ("1", "2") else "bold magenta"
+        console.print(f"[{style}]{key}.[/{style}] {label}")
+    console.print("[bold red]4.[/bold red] Exit")
+ 
+ 
 def main():
-    # Check for legacy CLI args first for backward compatibility
+    # Legacy CLI args for backward compatibility / scripting
     if len(sys.argv) > 1:
         parser = argparse.ArgumentParser(description="SpectraScan Legacy CLI")
         parser.add_argument("-t", "--target", help="Target")
         parser.add_argument("-d", "--domain", help="Domain")
         parser.add_argument("-i", "--ip", help="IP")
         args, _ = parser.parse_known_args()
-        
+ 
         if args.target:
-            scanner = PortScanner(args.target)
-            scanner.initialize()
-            scanner.scan()
-            scanner.print_summary()
+            try:
+                scanner = PortScanner(args.target)
+                scanner.initialize()
+                scanner.scan()
+                scanner.print_summary()
+            except Exception as e:
+                console.print(f"[!] Scan failed: {e}", style="bold red")
+                sys.exit(1)
             return
-
-    # CLI
+ 
     print_banner()
-    
+ 
     while True:
-        console.print("\n[bold green]1.[/bold green] Port Scanner")
-        console.print("[bold green]2.[/bold green] Advanced Modules (Domain/IP/Email/etc)")
-        console.print("[bold magenta]3.[/bold magenta] Protocol Modules (SMB/SNMP/LDAP/RDP/etc)")
-        console.print("[bold red]4.[/bold red] Exit")
-        
-        choice = input(f"{CYAN}root@spectra:~#{RESET} Select Option: ").strip()
-        
-        if choice == "1":
-            run_port_scan_cli()
-        elif choice == "2":
-            run_other_scanners()
-        elif choice == "3":
-            run_protocol_modules()
-        elif choice == "4":
+        print_main_menu()
+        try:
+            choice = input(f"{CYAN}root@spectra:~#{RESET} Select Option: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
+            break
+ 
+        if choice == "4":
             console.print("[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
             break
+        elif choice in MENU_ACTIONS:
+            MENU_ACTIONS[choice][1]()
         else:
             console.print("[!] Invalid Option. Please try again.", style="red")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
