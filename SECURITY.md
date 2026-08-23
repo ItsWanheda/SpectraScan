@@ -10,8 +10,9 @@ We maintain strict version control to ensure security patches are delivered effe
 
 | Version | Supported | Status |
 | :--- | :---: | :--- |
+| **3.0.0** | ✅ | Active |
 | **2.0.0** | ✅ | Active |
-| **1.5.0** | ✅ | Active |
+| **1.5.0** | ❌ | Not Supported |
 | **1.0.0** | ❌ | Not Supported |
 ---
 

@@ -254,7 +254,7 @@ The module automatically identifies the target type before running any lookups. 
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/ItsWanheda/SpectraScan.git
+git clone https://github.com/your-username/SpectraScan.git
 cd SpectraScan
 
 # 2. Create and activate a virtual environment

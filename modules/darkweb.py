@@ -1,248 +1,728 @@
 """
-SpectraScan Dark Web Recon Module
-=================================
-Features:
-  - Auto-target type detection (.onion, BTC, ETH, XMR, email, hash, ...)
-  - HTTPS/HTTP .onion banner grab (TLS cert, server, page title)
-  - BTC first-seen timestamp + balance + tx count (multi-API fallback)
-  - Onion link extraction from text
-  - Ahmia.fi dark web search (clearnet)
-  - Tor SOCKS connectivity check
-  - Heuristic risk scoring for BTC addresses
+SpectraScan Dark Web Intelligence Module
+========================================
 
-Soft dependencies (auto-detected):
-  - pysocks       -> required for .onion
-  - requests      -> required for clearnet APIs
-  - cryptography  -> richer TLS cert parsing
+Defensive / authorized OSINT reconnaissance module.
+
+Core features
+-------------
+- Automatic target detection
+- Onion v2/v3 detection
+- Tor SOCKS5 connectivity testing
+- HTTP/HTTPS onion reconnaissance
+- TLS certificate intelligence
+- HTTP security-header analysis
+- Redirect-chain analysis
+- Technology fingerprinting
+- IOC extraction
+- BTC address validation + public blockchain intelligence
+- ETH/LTC/XMR recognition
+- Email/domain intelligence
+- Ahmia clearnet search
+- Domain/DNS intelligence
+- Generic risk scoring
+- JSON report generation
+- Rich terminal interface
+
+Optional dependencies
+---------------------
+pysocks
+requests
+cryptography
+dnspython
+
+Environment
+-----------
+TOR_HOST=127.0.0.1
+TOR_PORT=9050
+
+Usage
+-----
+python -m Modules.darkweb
 """
 
 from __future__ import annotations
 
+import hashlib
+import html as html_mod
+import ipaddress
+import json
 import os
 import re
-import sys
-import json
 import socket
 import ssl
 import time
-import html as html_mod
-import hashlib
 import urllib.parse
-import ipaddress
-from datetime import datetime
-from typing import Dict, List, Optional, Any
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+# ---------------------------------------------------------------------
+# Optional dependencies
+# ---------------------------------------------------------------------
 
 try:
-    import socks  # PySocks
+    import socks  # type: ignore
+
     SOCKS_AVAILABLE = True
 except ImportError:
+    socks = None
     SOCKS_AVAILABLE = False
 
 try:
     import requests
+
     REQUESTS_AVAILABLE = True
 except ImportError:
+    requests = None
     REQUESTS_AVAILABLE = False
 
 try:
     from cryptography import x509
     from cryptography.hazmat.backends import default_backend
+
     CRYPTOGRAPHY_AVAILABLE = True
 except ImportError:
+    x509 = None
+    default_backend = None
     CRYPTOGRAPHY_AVAILABLE = False
 
+try:
+    import dns.resolver  # type: ignore
+
+    DNS_AVAILABLE = True
+except ImportError:
+    dns = None
+    DNS_AVAILABLE = False
+
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
 
 console = Console()
 
-# ============================================================
-# Constants
-# ============================================================
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-# Onion regex (v3 = 56 chars, v2 = 16 chars -)
-ONION_V3_REGEX = re.compile(r'\b[a-z2-7]{56}\.onion\b', re.IGNORECASE)
-ONION_V2_REGEX = re.compile(r'\b[a-z2-7]{16}\.onion\b', re.IGNORECASE)
+MODULE_NAME = "SpectraScan Dark Web Intelligence"
+MODULE_VERSION = "2.0.0"
 
-# Crypto regex
-BTC_BECH32_REGEX = re.compile(r'^bc1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{11,87}$', re.IGNORECASE)
-BTC_BASE58_REGEX = re.compile(r'^[a-km-zA-HJ-NP-Z1-9]{25,34}$')
-ETH_REGEX = re.compile(r'^0x[a-fA-F0-9]{40}$')
-XMR_REGEX = re.compile(r'^4[0-9AB][0-9a-zA-Z]{93}$')
-LTC_REGEX = re.compile(r'^[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}$')
+TOR_SOCKS_HOST = os.getenv("TOR_HOST", "127.0.0.1")
 
-# Generic regex
-EMAIL_REGEX = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
-IPV4_REGEX = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
-MD5_REGEX = re.compile(r'^[a-fA-F0-9]{32}$')
-SHA1_REGEX = re.compile(r'^[a-fA-F0-9]{40}$')
-SHA256_REGEX = re.compile(r'^[a-fA-F0-9]{64}$')
-PGP_KEY_REGEX = re.compile(r'-----BEGIN PGP PUBLIC KEY BLOCK-----')
-PHONE_REGEX = re.compile(r'^\+?\d{1,3}[\s.-]?\(?\d{1,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}$')
-DOMAIN_REGEX = re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
+try:
+    TOR_SOCKS_PORT = int(os.getenv("TOR_PORT", "9050"))
+except ValueError:
+    TOR_SOCKS_PORT = 9050
 
-# Public APIs (no key required)
+TOR_HTTP_PROXY = f"socks5h://{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}"
+
+DEFAULT_TIMEOUT = float(os.getenv("SPECTRASCAN_TIMEOUT", "20"))
+MAX_HTTP_BODY = int(os.getenv("SPECTRASCAN_MAX_BODY", "500000"))
+MAX_REDIRECTS = int(os.getenv("SPECTRASCAN_MAX_REDIRECTS", "5"))
+
+USER_AGENT = (
+    f"SpectraScan/{MODULE_VERSION} "
+    "(authorized-security-research)"
+)
+
+# ---------------------------------------------------------------------
+# Regex
+# ---------------------------------------------------------------------
+
+ONION_V3_REGEX = re.compile(
+    r"(?<![a-z0-9])"
+    r"[a-z2-7]{56}\.onion"
+    r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+ONION_V2_REGEX = re.compile(
+    r"(?<![a-z0-9])"
+    r"[a-z2-7]{16}\.onion"
+    r"(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+EMAIL_REGEX = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@"
+    r"[A-Za-z0-9.-]+\.[A-Za-z]{2,63}\b"
+)
+
+IPV4_REGEX = re.compile(
+    r"(?<![\d.])"
+    r"(?:\d{1,3}\.){3}\d{1,3}"
+    r"(?![\d.])"
+)
+
+IPV6_REGEX = re.compile(
+    r"(?<![0-9a-fA-F:])"
+    r"(?:[0-9a-fA-F]{1,4}:){2,7}"
+    r"[0-9a-fA-F]{0,4}"
+    r"(?![0-9a-fA-F:])"
+)
+
+DOMAIN_REGEX = re.compile(
+    r"\b"
+    r"(?:[a-zA-Z0-9]"
+    r"(?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
+    r"[a-zA-Z]{2,63}"
+    r"\b"
+)
+
+URL_REGEX = re.compile(
+    r"\bhttps?://"
+    r"[^\s<>'\"\\]+",
+    re.IGNORECASE,
+)
+
+BTC_BASE58_REGEX = re.compile(
+    r"^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$"
+)
+
+BTC_BECH32_REGEX = re.compile(
+    r"^bc1[ac-hj-np-z02-9]{11,87}$",
+    re.IGNORECASE,
+)
+
+BTC_TX_REGEX = re.compile(
+    r"^[a-fA-F0-9]{64}$"
+)
+
+ETH_REGEX = re.compile(
+    r"^0x[a-fA-F0-9]{40}$"
+)
+
+ETH_TX_REGEX = re.compile(
+    r"^0x[a-fA-F0-9]{64}$"
+)
+
+XMR_REGEX = re.compile(
+    r"^4[0-9AB][0-9a-zA-Z]{93}$"
+)
+
+LTC_REGEX = re.compile(
+    r"^[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}$"
+)
+
+MD5_REGEX = re.compile(r"^[a-fA-F0-9]{32}$")
+SHA1_REGEX = re.compile(r"^[a-fA-F0-9]{40}$")
+SHA256_REGEX = re.compile(r"^[a-fA-F0-9]{64}$")
+SHA512_REGEX = re.compile(r"^[a-fA-F0-9]{128}$")
+
+PGP_BEGIN_REGEX = re.compile(
+    r"-----BEGIN PGP PUBLIC KEY BLOCK-----",
+    re.IGNORECASE,
+)
+
+PHONE_REGEX = re.compile(
+    r"^\+?\d{1,3}"
+    r"[\s.-]?"
+    r"\(?\d{1,4}\)?"
+    r"[\s.-]?"
+    r"\d{3,4}"
+    r"[\s.-]?"
+    r"\d{3,4}$"
+)
+
+USERNAME_REGEX = re.compile(
+    r"^[a-zA-Z][a-zA-Z0-9_.-]{2,31}$"
+)
+
+DISPOSABLE_DOMAINS = {
+    "10minutemail.com",
+    "dispostable.com",
+    "fakeinbox.com",
+    "getnada.com",
+    "guerrillamail.com",
+    "maildrop.cc",
+    "mailinator.com",
+    "sharklasers.com",
+    "tempmail.com",
+    "throwaway.email",
+    "trashmail.com",
+    "yopmail.com",
+}
+
+SUSPICIOUS_TLDS = {
+    "cf",
+    "click",
+    "ga",
+    "gq",
+    "icu",
+    "ml",
+    "online",
+    "rest",
+    "site",
+    "top",
+    "tk",
+    "xyz",
+}
+
+SENSITIVE_HEADERS = {
+    "server",
+    "x-powered-by",
+    "x-aspnet-version",
+    "x-generator",
+}
+
+SECURITY_HEADERS = {
+    "strict-transport-security": "HSTS",
+    "content-security-policy": "CSP",
+    "x-frame-options": "X-Frame-Options",
+    "x-content-type-options": "X-Content-Type-Options",
+    "referrer-policy": "Referrer-Policy",
+    "permissions-policy": "Permissions-Policy",
+    "cross-origin-opener-policy": "COOP",
+    "cross-origin-resource-policy": "CORP",
+    "cross-origin-embedder-policy": "COEP",
+}
+
+COMMON_TECH_SIGNATURES = {
+    "WordPress": [
+        r"/wp-content/",
+        r"/wp-includes/",
+        r"wp-json",
+    ],
+    "Drupal": [
+        r"drupalSettings",
+        r"/sites/default/",
+        r"Drupal.settings",
+    ],
+    "Joomla": [
+        r"/media/system/",
+        r"Joomla!",
+    ],
+    "PHP": [
+        r"\.php(?:[?#]|$)",
+        r"PHPSESSID",
+    ],
+    "Laravel": [
+        r"laravel_session",
+        r"Laravel",
+    ],
+    "Django": [
+        r"csrftoken",
+        r"__django",
+    ],
+    "nginx": [
+        r"nginx",
+    ],
+    "Apache": [
+        r"Apache",
+    ],
+    "Cloudflare": [
+        r"cloudflare",
+        r"cf-ray",
+    ],
+    "React": [
+        r"react",
+        r"__NEXT_DATA__",
+    ],
+    "Next.js": [
+        r"__NEXT_DATA__",
+        r"_next/static/",
+    ],
+    "Vue.js": [
+        r"vue",
+        r"__vue__",
+    ],
+}
+
+# ---------------------------------------------------------------------
+# Public APIs
+# ---------------------------------------------------------------------
+
 BLOCKSTREAM_API = "https://blockstream.info/api"
 BLOCKCHAIR_API = "https://api.blockchair.com/bitcoin"
 BLOCKCHAIN_INFO = "https://blockchain.info"
 AHMIA_SEARCH = "https://ahmia.fi/search/?q="
 
-# Tor SOCKS config
-TOR_SOCKS_HOST = os.environ.get("TOR_HOST", "127.0.0.1")
-TOR_SOCKS_PORT = int(os.environ.get("TOR_PORT", "9050"))
-TOR_HTTP_PROXY = f"socks5h://{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}"
+# ---------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------
 
-# Disposable email domain blocklist (subset)
-DISPOSABLE_DOMAINS = {
-    "mailinator.com", "tempmail.com", "guerrillamail.com",
-    "10minutemail.com", "throwaway.email", "trashmail.com",
-    "yopmail.com", "fakeinbox.com", "maildrop.cc",
-    "getnada.com", "dispostable.com", "sharklasers.com",
-}
 
-# Suspicious TLDs (frequently abused for phishing)
-SUSPICIOUS_TLDS = {"tk", "ml", "ga", "cf", "gq", "xyz", "top", "click"}
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-# ============================================================
-# BTC Address Validation (Base58Check + Bech32/Bech32m)
-# ============================================================
 
-BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_float(
+    value: Any,
+    default: Optional[float] = None,
+) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_target(target: str) -> str:
+    """
+    Normalize a target without destroying URL path/query information.
+    """
+    target = (target or "").strip()
+
+    if not target:
+        return ""
+
+    if "://" in target:
+        parsed = urllib.parse.urlsplit(target)
+
+        host = parsed.hostname or ""
+
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+
+        path = parsed.path or ""
+
+        normalized = f"{parsed.scheme.lower()}://{host}{path}"
+
+        if parsed.query:
+            normalized += f"?{parsed.query}"
+
+        return normalized.rstrip("/")
+
+    return target.rstrip("/")
+
+
+def normalize_domain(value: str) -> str:
+    value = value.strip().lower()
+
+    if "://" in value:
+        value = urllib.parse.urlsplit(value).hostname or ""
+
+    value = value.split("/", 1)[0]
+    value = value.split(":", 1)[0]
+
+    return value.rstrip(".")
+
+
+def is_valid_ipv4(value: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+def is_valid_ipv6(value: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv6Address)
+    except ValueError:
+        return False
+
+
+def dedupe(items: Iterable[str]) -> List[str]:
+    return sorted(
+        set(
+            x.strip()
+            for x in items
+            if x and x.strip()
+        )
+    )
+
+
+# ---------------------------------------------------------------------
+# Base58Check
+# ---------------------------------------------------------------------
+
+BASE58_ALPHABET = (
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    "abcdefghijkmnopqrstuvwxyz"
+)
+
+
+def _base58_decode(value: str) -> bytes:
+    number = 0
+
+    for char in value:
+        number *= 58
+        number += BASE58_ALPHABET.index(char)
+
+    decoded = bytearray()
+
+    while number:
+        decoded.append(number % 256)
+        number //= 256
+
+    leading_zeroes = 0
+
+    for char in value:
+        if char == "1":
+            leading_zeroes += 1
+        else:
+            break
+
+    return bytes(
+        b"\x00" * leading_zeroes
+        + bytes(reversed(decoded))
+    )
+
+
+def validate_btc_base58(address: str) -> bool:
+    try:
+        if not BTC_BASE58_REGEX.fullmatch(address):
+            return False
+
+        decoded = _base58_decode(address)
+
+        if len(decoded) != 25:
+            return False
+
+        version = decoded[0]
+
+        if version not in (0x00, 0x05):
+            return False
+
+        payload = decoded[:-4]
+        checksum = decoded[-4:]
+
+        expected = hashlib.sha256(
+            hashlib.sha256(payload).digest()
+        ).digest()[:4]
+
+        return checksum == expected
+
+    except (ValueError, IndexError):
+        return False
+
+
+# ---------------------------------------------------------------------
+# Bech32 / Bech32m
+# ---------------------------------------------------------------------
+
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 
-def _base58_decode(s: str) -> bytes:
-    """Decode a Base58 string to raw bytes."""
-    n = 0
-    for c in s:
-        n = n * 58 + BASE58_ALPHABET.index(c)
-    result = []
-    while n > 0:
-        result.append(n % 256)
-        n //= 256
-    for c in s:
-        if c == "1":
-            result.append(0)
-        else:
-            break
-    return bytes(reversed(result))
+def _bech32_polymod(values: Iterable[int]) -> int:
+    generators = [
+        0x3B6A57B2,
+        0x26508E6D,
+        0x1EA119FA,
+        0x3D4233DD,
+        0x2A1462B3,
+    ]
+
+    checksum = 1
+
+    for value in values:
+        top = checksum >> 25
+
+        checksum = (
+            (checksum & 0x1FFFFFF) << 5
+        ) ^ value
+
+        for index in range(5):
+            if (top >> index) & 1:
+                checksum ^= generators[index]
+
+    return checksum
 
 
-def _bech32_polymod(values):
-    GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
-    chk = 1
-    for v in values:
-        b = chk >> 25
-        chk = (chk & 0x1ffffff) << 5 ^ v
-        for i in range(5):
-            chk ^= GEN[i] if ((b >> i) & 1) else 0
-    return chk
+def _bech32_hrp_expand(hrp: str) -> List[int]:
+    return (
+        [ord(char) >> 5 for char in hrp]
+        + [0]
+        + [ord(char) & 31 for char in hrp]
+    )
 
 
-def _bech32_hrp_expand(hrp):
-    return [ord(x) >> 5 for x in hrp] + + [ord(x) & 31 for x in hrp]
-
-
-def _bech32_decode(bech):
-    if any(ord(x) < 33 or ord(x) > 126 for x in bech):
+def _bech32_decode(
+    value: str,
+) -> Tuple[Optional[str], Optional[List[int]], Optional[str]]:
+    if not value:
         return None, None, None
-    if bech.lower() != bech and bech.upper() != bech:
+
+    if len(value) > 90:
         return None, None, None
-    bech = bech.lower()
-    pos = bech.rfind("1")
-    if pos < 1 or pos + 7 > len(bech) or len(bech) > 90:
+
+    if value.lower() != value and value.upper() != value:
         return None, None, None
-    if not all(x in BECH32_CHARSET for x in bech[pos + 1:]):
+
+    value = value.lower()
+
+    position = value.rfind("1")
+
+    if position < 1:
         return None, None, None
-    hrp = bech[:pos]
-    data = [BECH32_CHARSET.find(x) for x in bech[pos + 1:]]
-    const = _bech32_polymod(_bech32_hrp_expand(hrp) + data)
-    if const == 1:
-        return hrp, data[:-6], "bech32"
-    if const == 0x2bc830a3:
-        return hrp, data[:-6], "bech32m"
-    return None, None, None
+
+    if position + 7 > len(value):
+        return None, None, None
+
+    data_part = value[position + 1:]
+
+    if not all(
+        char in BECH32_CHARSET
+        for char in data_part
+    ):
+        return None, None, None
+
+    hrp = value[:position]
+
+    data = [
+        BECH32_CHARSET.find(char)
+        for char in data_part
+    ]
+
+    polymod = _bech32_polymod(
+        _bech32_hrp_expand(hrp) + data
+    )
+
+    if polymod == 1:
+        spec = "bech32"
+    elif polymod == 0x2BC830A3:
+        spec = "bech32m"
+    else:
+        return None, None, None
+
+    return hrp, data[:-6], spec
 
 
-def _convertbits(data, frombits, tobits, pad=True):
-    acc, bits, ret = 0, 0, []
-    maxv = (1 << tobits) - 1
-    max_acc = (1 << (frombits + tobits - 1)) - 1
+def _convertbits(
+    data: Iterable[int],
+    frombits: int,
+    tobits: int,
+    pad: bool = True,
+) -> Optional[List[int]]:
+    accumulator = 0
+    bits = 0
+    result: List[int] = []
+
+    max_value = (1 << tobits) - 1
+    max_accumulator = (
+        1 << (frombits + tobits - 1)
+    ) - 1
+
     for value in data:
-        if value < 0 or (value >> frombits):
+        if value < 0 or value >> frombits:
             return None
-        acc = ((acc << frombits) | value) & max_acc
+
+        accumulator = (
+            (accumulator << frombits) | value
+        ) & max_accumulator
+
         bits += frombits
+
         while bits >= tobits:
             bits -= tobits
-            ret.append((acc >> bits) & maxv)
+
+            result.append(
+                (accumulator >> bits) & max_value
+            )
+
     if pad:
         if bits:
-            ret.append((acc << (tobits - bits)) & maxv)
-    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+            result.append(
+                (accumulator << (tobits - bits))
+                & max_value
+            )
+
+    elif bits >= frombits:
         return None
-    return ret
+
+    elif (
+        (accumulator << (tobits - bits))
+        & max_value
+    ):
+        return None
+
+    return result
 
 
-def validate_btc_address(addr: str) -> bool:
-    """Validate a BTC mainnet address (Base58Check or Bech32/Bech32m)."""
+def validate_btc_bech32(address: str) -> bool:
     try:
-        if addr.lower().startswith("bc1"):
-            hrpgot, data, spec = _bech32_decode(addr)
-            if hrpgot is None or data is None:
-                return False
-            if hrpgot != "bc":
-                return False
-            decoded = _convertbits(data[1:], 5, 8, False)
-            if decoded is None or len(decoded) < 2:
-                return False
-            # witness version 0..16
-            if decoded > 16:
-                return False
-            # v0 -> 20 or 32 bytes (P2WPKH / P2WSH)
-            if decoded == 0 and len(decoded) not in (20, 32):
-                return False
-            # general witness program 2..40 bytes
-            if not (2 <= len(decoded) <= 40):
-                return False
-            # spec <-> witness version coupling (BIP-350)
-            if spec == "bech32m" and decoded == 0:
-                return False
-            if spec == "bech32" and decoded != 0:
-                return False
-            return True
+        hrp, data, spec = _bech32_decode(address)
 
-        # Base58Check path
-        if not (26 <= len(addr) <= 35):
+        if hrp != "bc" or data is None or spec is None:
             return False
-        if not all(c in BASE58_ALPHABET for c in addr):
+
+        if not data:
             return False
-        decoded = _base58_decode(addr)
-        if len(decoded) != 25:
+
+        witness_version = data[0]
+
+        if witness_version > 16:
             return False
-        # 0x00 = P2PKH (1...), 0x05 = P2SH (3...)
-        if decoded not in (0, 5):
+
+        program = _convertbits(
+            data[1:],
+            5,
+            8,
+            False,
+        )
+
+        if program is None:
             return False
-        payload, checksum = decoded[:-4], decoded[-4:]
-        hashed = hashlib.sha256(hashlib.sha256(payload).digest()).digest()
-        return hashed[:4] == checksum
+
+        if not 2 <= len(program) <= 40:
+            return False
+
+        if witness_version == 0:
+            if spec != "bech32":
+                return False
+
+            if len(program) not in (20, 32):
+                return False
+
+        else:
+            if spec != "bech32m":
+                return False
+
+        return True
+
     except Exception:
         return False
 
 
-# ============================================================
-# Auto Target Type Detection
-# ============================================================
+def validate_btc_address(address: str) -> bool:
+    address = address.strip()
 
-def detect_target_type(target: str) -> Dict:
-    """Auto-detect the type of target (onion, crypto, email, hash, ...)."""
-    if not target:
-        return {"input": target, "type": "empty", "valid": False, "confidence": 0}
+    if validate_btc_base58(address):
+        return True
+
+    return validate_btc_bech32(address)
+
+
+def btc_address_format(address: str) -> Optional[str]:
+    if not validate_btc_address(address):
+        return None
+
+    if address.lower().startswith("bc1"):
+        return "Bech32 / SegWit"
+
+    if address.startswith("1"):
+        return "Legacy P2PKH"
+
+    if address.startswith("3"):
+        return "P2SH"
+
+    return "Bitcoin"
+
+
+# ---------------------------------------------------------------------
+# Target detection
+# ---------------------------------------------------------------------
+
+
+def detect_target_type(target: str) -> Dict[str, Any]:
+    """
+    Detect and normalize a target.
+
+    This function remains compatible with the original SpectraScan API.
+    """
+
+    original = target or ""
 
     result: Dict[str, Any] = {
-        "input": target,
+        "input": original,
+        "normalized": normalize_target(original),
         "type": "unknown",
         "subtype": None,
         "valid": False,
@@ -251,412 +731,637 @@ def detect_target_type(target: str) -> Dict:
         "warnings": [],
     }
 
-    # Strip scheme & trailing slash for matching
-    norm = target.strip()
-    if "://" in norm:
-        norm = norm.split("://", 1)
-    norm = norm.rstrip("/").split("?", 1).split("#", 1)
-
-    # 1) .onion v3 (most specific)
-    m = ONION_V3_REGEX.search(norm)
-    if m:
-        result.update({
-            "type": "onion", "subtype": "v3", "valid": True, "confidence": 100,
-            "metadata": {"onion": m.group(0).lower(),
-                         "length": len(m.group(0).split("."))},
-        })
+    if not original.strip():
+        result["type"] = "empty"
         return result
 
-    # 2) .onion v2
-    m = ONION_V2_REGEX.search(norm)
-    if m:
-        result.update({
-            "type": "onion", "subtype": "v2", "valid": True, "confidence": 100,
-            "metadata": {"onion": m.group(0).lower(),
-                         "length": len(m.group(0).split("."))},
-            "warnings": ["Onion v2 is DEPRECATED - Tor >= 0.4.6 no longer resolves it."],
-        })
+    normalized = result["normalized"]
+    plain = normalized
+
+    # URL
+    if re.match(r"^https?://", plain, re.IGNORECASE):
+        parsed = urllib.parse.urlsplit(plain)
+
+        hostname = parsed.hostname or ""
+
+        if hostname.endswith(".onion"):
+            onion_type = (
+                "v3"
+                if ONION_V3_REGEX.fullmatch(hostname)
+                else "v2"
+                if ONION_V2_REGEX.fullmatch(hostname)
+                else None
+            )
+
+            if onion_type:
+                result.update(
+                    {
+                        "type": "onion",
+                        "subtype": onion_type,
+                        "valid": True,
+                        "confidence": 100,
+                        "metadata": {
+                            "onion": hostname.lower(),
+                            "scheme": parsed.scheme.lower(),
+                            "port": parsed.port,
+                            "path": parsed.path or "/",
+                        },
+                    }
+                )
+
+                if onion_type == "v2":
+                    result["warnings"].append(
+                        "Onion v2 is deprecated."
+                    )
+
+                return result
+
+        result.update(
+            {
+                "type": "url",
+                "valid": True,
+                "confidence": 98,
+                "metadata": {
+                    "scheme": parsed.scheme.lower(),
+                    "host": hostname.lower(),
+                    "port": parsed.port,
+                    "path": parsed.path or "/",
+                },
+            }
+        )
+
         return result
 
-    # 3) Email
-    if EMAIL_REGEX.match(norm):
-        email = norm.lower()
-        domain = email.split("@", 1)
-        result.update({
-            "type": "email", "valid": True, "confidence": 95,
-            "metadata": {"email": email, "domain": domain},
-        })
+    # Onion hostname
+    onion_v3 = ONION_V3_REGEX.fullmatch(plain)
+    if onion_v3:
+        result.update(
+            {
+                "type": "onion",
+                "subtype": "v3",
+                "valid": True,
+                "confidence": 100,
+                "metadata": {
+                    "onion": plain.lower(),
+                    "length": 56,
+                },
+            }
+        )
+        return result
+
+    onion_v2 = ONION_V2_REGEX.fullmatch(plain)
+    if onion_v2:
+        result.update(
+            {
+                "type": "onion",
+                "subtype": "v2",
+                "valid": True,
+                "confidence": 100,
+                "metadata": {
+                    "onion": plain.lower(),
+                    "length": 16,
+                },
+                "warnings": [
+                    "Onion v2 is deprecated."
+                ],
+            }
+        )
+        return result
+
+    # Email
+    email_match = EMAIL_REGEX.fullmatch(plain)
+
+    if email_match:
+        email = plain.lower()
+        domain = email.rsplit("@", 1)[1]
+
+        result.update(
+            {
+                "type": "email",
+                "valid": True,
+                "confidence": 98,
+                "metadata": {
+                    "email": email,
+                    "domain": domain,
+                    "disposable": (
+                        domain in DISPOSABLE_DOMAINS
+                    ),
+                },
+            }
+        )
+
         if domain in DISPOSABLE_DOMAINS:
-            result["metadata"]["disposable"] = True
-            result["warnings"].append("Disposable email domain")
+            result["warnings"].append(
+                "Disposable email domain."
+            )
+
         return result
 
-    # 4) IPv4
-    if IPV4_REGEX.match(norm):
-        try:
-            ip = ipaddress.ip_address(norm)
-            result.update({
-                "type": "ipv4", "valid": True, "confidence": 95,
-                "metadata": {"ip": str(ip), "private": ip.is_private,
-                             "loopback": ip.is_loopback},
-            })
+    # IPv4
+    if IPV4_REGEX.fullmatch(plain) and is_valid_ipv4(plain):
+        ip = ipaddress.ip_address(plain)
+
+        result.update(
+            {
+                "type": "ipv4",
+                "valid": True,
+                "confidence": 99,
+                "metadata": {
+                    "ip": str(ip),
+                    "private": ip.is_private,
+                    "loopback": ip.is_loopback,
+                    "reserved": ip.is_reserved,
+                    "global": ip.is_global,
+                },
+            }
+        )
+
+        return result
+
+    # IPv6
+    if ":" in plain and is_valid_ipv6(plain):
+        ip = ipaddress.ip_address(plain)
+
+        result.update(
+            {
+                "type": "ipv6",
+                "valid": True,
+                "confidence": 99,
+                "metadata": {
+                    "ip": str(ip),
+                    "private": ip.is_private,
+                    "loopback": ip.is_loopback,
+                    "reserved": ip.is_reserved,
+                    "global": ip.is_global,
+                },
+            }
+        )
+
+        return result
+
+    # BTC
+    if validate_btc_address(plain):
+        result.update(
+            {
+                "type": "crypto",
+                "subtype": "btc",
+                "valid": True,
+                "confidence": 100,
+                "metadata": {
+                    "format": btc_address_format(plain),
+                },
+            }
+        )
+        return result
+
+    # ETH transaction hash / address
+    if ETH_TX_REGEX.fullmatch(plain):
+        result.update(
+            {
+                "type": "crypto",
+                "subtype": "eth_tx",
+                "valid": True,
+                "confidence": 99,
+            }
+        )
+        return result
+
+    if ETH_REGEX.fullmatch(plain):
+        result.update(
+            {
+                "type": "crypto",
+                "subtype": "eth",
+                "valid": True,
+                "confidence": 99,
+                "metadata": {
+                    "format": "Ethereum address"
+                },
+            }
+        )
+        return result
+
+    # XMR
+    if XMR_REGEX.fullmatch(plain):
+        result.update(
+            {
+                "type": "crypto",
+                "subtype": "xmr",
+                "valid": True,
+                "confidence": 75,
+                "metadata": {
+                    "format": "Monero"
+                },
+                "warnings": [
+                    "Monero validation is format-based."
+                ],
+            }
+        )
+        return result
+
+    # LTC
+    if LTC_REGEX.fullmatch(plain):
+        result.update(
+            {
+                "type": "crypto",
+                "subtype": "ltc",
+                "valid": True,
+                "confidence": 75,
+                "metadata": {
+                    "format": "Litecoin"
+                },
+                "warnings": [
+                    "Litecoin validation is format-based."
+                ],
+            }
+        )
+        return result
+
+    # Hashes
+    hash_types = (
+        ("sha512", SHA512_REGEX),
+        ("sha256", SHA256_REGEX),
+        ("sha1", SHA1_REGEX),
+        ("md5", MD5_REGEX),
+    )
+
+    for name, pattern in hash_types:
+        if pattern.fullmatch(plain):
+            result.update(
+                {
+                    "type": "hash",
+                    "subtype": name,
+                    "valid": True,
+                    "confidence": 96,
+                }
+            )
             return result
-        except ValueError:
-            pass
 
-    # 5) BTC (full checksum validation)
-    if BTC_BECH32_REGEX.match(norm) or BTC_BASE58_REGEX.match(norm):
-        if validate_btc_address(norm):
-            result.update({
-                "type": "crypto", "subtype": "btc", "valid": True, "confidence": 100,
-            })
-            if norm.lower().startswith("bc1"):
-                result["metadata"]["format"] = "Bech32/Bech32m (Native SegWit)"
-            elif norm.startswith("1"):
-                result["metadata"]["format"] = "Legacy P2PKH"
-            else:
-                result["metadata"]["format"] = "P2SH (SegWit compatible)"
-            return result
-
-    # 6) ETH
-    if ETH_REGEX.match(norm):
-        result.update({
-            "type": "crypto", "subtype": "eth", "valid": True, "confidence": 95,
-            "metadata": {"format": "Ethereum"},
-        })
+    # PGP
+    if PGP_BEGIN_REGEX.search(original):
+        result.update(
+            {
+                "type": "pgp_key",
+                "valid": True,
+                "confidence": 100,
+            }
+        )
         return result
 
-    # 7) XMR
-    if XMR_REGEX.match(norm):
-        result.update({
-            "type": "crypto", "subtype": "xmr", "valid": True, "confidence": 75,
-            "metadata": {"format": "Monero"},
-            "warnings": ["XMR validation is regex-based only."],
-        })
-        return result
+    # Phone
+    if PHONE_REGEX.fullmatch(plain):
+        digits = re.sub(r"\D", "", plain)
 
-    # 8) LTC
-    if LTC_REGEX.match(norm):
-        result.update({
-            "type": "crypto", "subtype": "ltc", "valid": True, "confidence": 75,
-            "metadata": {"format": "Litecoin"},
-            "warnings": ["LTC validation is regex-based only."],
-        })
-        return result
-
-    # 9) Hashes (longest first to avoid false positives)
-    if SHA256_REGEX.match(norm):
-        result.update({"type": "hash", "subtype": "sha256",
-                       "valid": True, "confidence": 95})
-        return result
-    if SHA1_REGEX.match(norm):
-        result.update({"type": "hash", "subtype": "sha1",
-                       "valid": True, "confidence": 95})
-        return result
-    if MD5_REGEX.match(norm):
-        result.update({"type": "hash", "subtype": "md5",
-                       "valid": True, "confidence": 90})
-        return result
-
-    # 10) PGP key block
-    if PGP_KEY_REGEX.search(target):
-        result.update({"type": "pgp_key", "valid": True, "confidence": 100})
-        return result
-
-    # 11) Phone
-    if PHONE_REGEX.match(norm):
-        digits = re.sub(r"\D", "", norm)
         if 7 <= len(digits) <= 15:
-            result.update({
-                "type": "phone", "valid": True, "confidence": 70,
-                "metadata": {"digits": digits, "length": len(digits)},
-            })
+            result.update(
+                {
+                    "type": "phone",
+                    "valid": True,
+                    "confidence": 70,
+                    "metadata": {
+                        "digits": digits,
+                        "length": len(digits),
+                    },
+                }
+            )
             return result
 
-    # 12) Domain (most generic - checked last)
-    if DOMAIN_REGEX.match(norm):
-        domain = norm.lower()
+    # Domain
+    domain = normalize_domain(plain)
+
+    if DOMAIN_REGEX.fullmatch(domain):
         tld = domain.rsplit(".", 1)[-1]
-        result.update({
-            "type": "domain", "valid": True, "confidence": 80,
-            "metadata": {"domain": domain, "tld": tld},
-        })
+
+        result.update(
+            {
+                "type": "domain",
+                "valid": True,
+                "confidence": 90,
+                "metadata": {
+                    "domain": domain,
+                    "tld": tld,
+                },
+            }
+        )
+
         if tld in SUSPICIOUS_TLDS:
-            result["warnings"].append(f"Free/abuse-prone TLD: .{tld}")
+            result["warnings"].append(
+                f"Abuse-prone/suspicious TLD: .{tld}"
+            )
+
         return result
 
-    # 13) Possible username
-    if re.match(r"^[a-zA-Z][a-zA-Z0-9_.-]{2,30}$", norm):
-        result.update({
-            "type": "username", "valid": True, "confidence": 40,
-            "warnings": ["Likely a username - confirm via OSINT."],
-        })
+    # Username
+    if USERNAME_REGEX.fullmatch(plain):
+        result.update(
+            {
+                "type": "username",
+                "valid": True,
+                "confidence": 45,
+            }
+        )
+
+        result["warnings"].append(
+            "Likely username; confirm through OSINT sources."
+        )
+
         return result
 
     return result
 
 
-# ============================================================
-# Tor Connectivity Check
-# ============================================================
+# ---------------------------------------------------------------------
+# IOC extraction
+# ---------------------------------------------------------------------
 
-def check_tor_connection(timeout: float = 15.0) -> Dict:
-    """Verify the Tor SOCKS proxy is reachable and functional."""
+
+def extract_iocs(text: str) -> Dict[str, Any]:
+    """
+    Extract and normalize common public indicators from text.
+    """
+
+    text = text or ""
+
+    urls = dedupe(
+        URL_REGEX.findall(text)
+    )
+
+    onions_v3 = dedupe(
+        m.group(0).lower()
+        for m in ONION_V3_REGEX.finditer(text)
+    )
+
+    onions_v2 = dedupe(
+        m.group(0).lower()
+        for m in ONION_V2_REGEX.finditer(text)
+    )
+
+    emails = dedupe(
+        m.group(0).lower()
+        for m in EMAIL_REGEX.finditer(text)
+    )
+
+    ipv4 = []
+
+    for match in IPV4_REGEX.finditer(text):
+        value = match.group(0)
+
+        if is_valid_ipv4(value):
+            ipv4.append(value)
+
+    ipv4 = dedupe(ipv4)
+
+    ipv6 = []
+
+    for match in IPV6_REGEX.finditer(text):
+        value = match.group(0)
+
+        if is_valid_ipv6(value):
+            ipv6.append(value)
+
+    ipv6 = dedupe(ipv6)
+
+    domains = []
+
+    for match in DOMAIN_REGEX.finditer(text):
+        value = match.group(0).lower()
+
+        if not value.endswith(".onion"):
+            domains.append(value)
+
+    domains = dedupe(domains)
+
+    btc = []
+    eth = []
+    xmr = []
+    ltc = []
+
+    tokens = re.findall(
+        r"[A-Za-z0-9]{20,100}",
+        text,
+    )
+
+    for token in tokens:
+        clean = token.strip(".,;:!?()[]{}<>\"'")
+
+        if validate_btc_address(clean):
+            btc.append(clean)
+
+        elif ETH_REGEX.fullmatch(clean):
+            eth.append(clean)
+
+        elif XMR_REGEX.fullmatch(clean):
+            xmr.append(clean)
+
+        elif LTC_REGEX.fullmatch(clean):
+            ltc.append(clean)
+
+    hashes = {
+        "md5": [],
+        "sha1": [],
+        "sha256": [],
+        "sha512": [],
+    }
+
+    for token in re.findall(
+        r"\b[a-fA-F0-9]{32,128}\b",
+        text,
+    ):
+        length = len(token)
+
+        if length == 32:
+            hashes["md5"].append(token.lower())
+
+        elif length == 40:
+            hashes["sha1"].append(token.lower())
+
+        elif length == 64:
+            hashes["sha256"].append(token.lower())
+
+        elif length == 128:
+            hashes["sha512"].append(token.lower())
+
+    pgp_blocks = re.findall(
+        r"-----BEGIN PGP PUBLIC KEY BLOCK-----.*?"
+        r"-----END PGP PUBLIC KEY BLOCK-----",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    return {
+        "urls": dedupe(urls),
+        "onions": {
+            "v3": dedupe(onions_v3),
+            "v2": dedupe(onions_v2),
+        },
+        "domains": dedupe(domains),
+        "ipv4": dedupe(ipv4),
+        "ipv6": dedupe(ipv6),
+        "emails": dedupe(emails),
+        "crypto": {
+            "btc": dedupe(btc),
+            "eth": dedupe(eth),
+            "xmr": dedupe(xmr),
+            "ltc": dedupe(ltc),
+        },
+        "hashes": {
+            key: dedupe(value)
+            for key, value in hashes.items()
+        },
+        "pgp_blocks": pgp_blocks,
+        "counts": {
+            "urls": len(urls),
+            "onions": len(onions_v3) + len(onions_v2),
+            "domains": len(domains),
+            "ipv4": len(ipv4),
+            "ipv6": len(ipv6),
+            "emails": len(emails),
+            "btc": len(btc),
+            "eth": len(eth),
+            "xmr": len(xmr),
+            "ltc": len(ltc),
+            "hashes": sum(
+                len(value)
+                for value in hashes.values()
+            ),
+            "pgp_blocks": len(pgp_blocks),
+        },
+    }
+
+
+def extract_onion_links(text: str) -> Dict[str, Any]:
+    iocs = extract_iocs(text)
+
+    return {
+        "v3": iocs["onions"]["v3"],
+        "v2": iocs["onions"]["v2"],
+        "total": (
+            len(iocs["onions"]["v3"])
+            + len(iocs["onions"]["v2"])
+        ),
+    }
+
+
+# ---------------------------------------------------------------------
+# Tor
+# ---------------------------------------------------------------------
+
+
+def _tor_socket(
+    timeout: float = DEFAULT_TIMEOUT,
+):
+    if not SOCKS_AVAILABLE:
+        raise RuntimeError(
+            "PySocks is not installed."
+        )
+
+    sock = socks.socksocket()
+
+    sock.set_proxy(
+        socks.PROXY_TYPE_SOCKS5,
+        TOR_SOCKS_HOST,
+        TOR_SOCKS_PORT,
+        rdns=True,
+    )
+
+    sock.settimeout(timeout)
+
+    return sock
+
+
+def check_tor_connection(
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+
     result = {
         "socks_reachable": False,
         "tor_working": False,
         "exit_ip": None,
         "error": None,
+        "timestamp": utc_now(),
     }
+
     if not SOCKS_AVAILABLE:
-        result["error"] = "pysocks not installed (pip install pysocks)"
+        result["error"] = (
+            "pysocks not installed."
+        )
         return result
 
-    s: Optional[socks.socksocket] = None
+    sock = None
+
     try:
-        s = socks.socksocket()
-        s.set_proxy(socks.PROXY_TYPE_SOCKS5, TOR_SOCKS_HOST, TOR_SOCKS_PORT, rdns=True)
-        s.settimeout(timeout)
-        s.connect(("check.torproject.org", 443))
+        sock = _tor_socket(timeout)
+
+        sock.connect(
+            ("check.torproject.org", 443)
+        )
+
         result["socks_reachable"] = True
 
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        with ctx.wrap_socket(s, server_hostname="check.torproject.org") as ss:
-            req = (
+        context = ssl.create_default_context()
+
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        with context.wrap_socket(
+            sock,
+            server_hostname="check.torproject.org",
+        ) as secure:
+
+            request = (
                 "GET /api/ip HTTP/1.1\r\n"
                 "Host: check.torproject.org\r\n"
-                "User-Agent: SpectraScan/1.0\r\n"
-                "Connection: close\r\n\r\n"
+                f"User-Agent: {USER_AGENT}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
             )
-            ss.send(req.encode())
+
+            secure.sendall(
+                request.encode()
+            )
+
             chunks = []
+
             while True:
-                chunk = ss.recv(4096)
+                chunk = secure.recv(8192)
+
                 if not chunk:
                     break
+
                 chunks.append(chunk)
-            data = b"".join(chunks)
-            if b"\r\n\r\n" in data:
-                body = data.split(b"\r\n\r\n", 1)
+
+            raw = b"".join(chunks)
+
+            if b"\r\n\r\n" in raw:
+                body = raw.split(
+                    b"\r\n\r\n",
+                    1,
+                )[1]
+
                 try:
-                    j = json.loads(body.decode("utf-8", errors="ignore"))
-                    result["exit_ip"] = j.get("IP") or j.get("ip")
+                    payload = json.loads(
+                        body.decode(
+                            "utf-8",
+                            errors="ignore",
+                        )
+                    )
+
+                    result["exit_ip"] = (
+                        payload.get("IP")
+                        or payload.get("ip")
+                    )
+
                 except Exception:
                     pass
-                result["tor_working"] = True
-    except socks.ProxyError as e:
-        result["error"] = f"Proxy error: {e}"
-    except socket.timeout:
-        result["error"] = "Tor connection timed out (is Tor running?)"
-    except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
+
+            result["tor_working"] = True
+
+    except Exception as exc:
+        result["error"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
     finally:
-        if s:
-            try:
-                s.close()
-            except Exception:
-                pass
-    return result
-
-
-# ============================================================
-# HTTPS / HTTP .onion Banner Grab
-# ============================================================
-
-def _extract_title(body: bytes) -> Optional[str]:
-    """Extract <title> from an HTML body and decode entities."""
-    try:
-        text = body.decode("utf-8", errors="ignore")
-        m = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
-        if m:
-            return html_mod.unescape(m.group(1)).strip()[:500]
-    except Exception:
-        pass
-    return None
-
-
-def grab_onion_banner(
-    onion: str,
-    port: int = 443,
-    use_ssl: bool = True,
-    timeout: float = 30.0,
-    max_body: int = 200_000,
-) -> Dict:
-    """
-    Connect to a .onion service over Tor and grab its HTTP(S) banner.
-    Extracts: TLS cert (subject/issuer/SAN/SHA-256), HTTP status,
-    headers, page title.
-    """
-    if not SOCKS_AVAILABLE:
-        return {"error": "pysocks not installed (pip install pysocks)"}
-
-    # Parse the target
-    target = onion.strip()
-    if "://" in target:
-        parsed = urllib.parse.urlparse(target)
-        host = parsed.hostname
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        use_ssl = parsed.scheme == "https"
-        path = parsed.path or "/"
-        if parsed.query:
-            path += "?" + parsed.query
-    else:
-        # host[:port][/path]
-        host_part = target.split("/", 1)
-        path = "/" + target.split("/", 1) if "/" in target else "/"
-        if ":" in host_part:
-            host, port_str = host_part.rsplit(":", 1)
-            try:
-                port = int(port_str)
-            except ValueError:
-                port = port
-        else:
-            host = host_part
-
-    if not host:
-        return {"error": "No hostname parsed"}
-
-    if not (ONION_V3_REGEX.search(host) or ONION_V2_REGEX.search(host)):
-        return {"error": f"Invalid .onion hostname: {host}"}
-
-    result: Dict[str, Any] = {
-        "target": onion,
-        "host": host,
-        "port": port,
-        "scheme": "https" if use_ssl else "http",
-        "reachable": False,
-        "tls": None,
-        "http": None,
-        "title": None,
-        "error": None,
-    }
-
-    sock: Optional[socket.socket] = None
-    try:
-        sock = socks.socksocket()
-        sock.set_proxy(socks.PROXY_TYPE_SOCKS5, TOR_SOCKS_HOST, TOR_SOCKS_PORT, rdns=True)
-        sock.settimeout(timeout)
-        sock.connect((host, port))
-        result["reachable"] = True
-
-        stream = sock
-        if use_ssl:
-            try:
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                stream = ctx.wrap_socket(sock, server_hostname=host)
-
-                tls_info: Dict[str, Any] = {"version": stream.version()}
-                if stream.cipher():
-                    tls_info["cipher"] = stream.cipher()
-
-                try:
-                    der = stream.getpeercert(binary_form=True)
-                    if der:
-                        tls_info["sha256_fp"] = hashlib.sha256(der).hexdigest()
-                        tls_info["sha1_fp"] = hashlib.sha1(der).hexdigest()
-                        tls_info["cert_size"] = len(der)
-
-                        if CRYPTOGRAPHY_AVAILABLE:
-                            cert = x509.load_der_x509_certificate(der, default_backend())
-                            tls_info["subject"] = cert.subject.rfc4514_string()
-                            tls_info["issuer"] = cert.issuer.rfc4514_string()
-                            try:
-                                ext = cert.extensions.get_extension_for_class(
-                                    x509.SubjectAlternativeName
-                                )
-                                tls_info["san"] = [str(d) for d in ext.value]
-                            except Exception:
-                                pass
-                            tls_info["not_before"] = cert.not_valid_before.isoformat()
-                            tls_info["not_after"] = cert.not_valid_after.isoformat()
-                            delta = (cert.not_valid_after - datetime.utcnow()).days
-                            tls_info["days_to_expiry"] = delta
-                            tls_info["expired"] = delta < 0
-                except Exception as e:
-                    tls_info["cert_error"] = str(e)
-
-                result["tls"] = tls_info
-            except (ssl.SSLError, OSError) as e:
-                result["tls"] = {"error": str(e)}
-
-        # Send HTTP request
-        req_lines = [
-            f"GET {path} HTTP/1.1",
-            f"Host: {host}",
-            "User-Agent: Mozilla/5.0 (X11; Linux x86_64) SpectraScan/1.0",
-            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language: en-US,en;q=0.5",
-            "Connection: close",
-            "",
-            "",
-        ]
-        stream.send("\r\n".join(req_lines).encode())
-
-        chunks, total = [], 0
-        while True:
-            try:
-                chunk = stream.recv(8192)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= max_body:
-                break
-        data = b"".join(chunks)
-
-        # Parse HTTP response
-        if b"\r\n\r\n" in data:
-            header_part, body = data.split(b"\r\n\r\n", 1)
-            try:
-                lines = header_part.decode("iso-8859-1", errors="ignore").split("\r\n")
-                status_line = lines if lines else ""
-
-                headers: Dict[str, str] = {}
-                for line in lines[1:]:
-                    if ":" in line:
-                        k, _, v = line.partition(":")
-                        headers[k.strip().lower()] = v.strip()
-
-                http_info: Dict[str, Any] = {
-                    "status": status_line,
-                    "status_code": int(status_line.split())
-                        if len(status_line.split()) >= 2 else None,
-                    "headers": headers,
-                    "body_size": len(body),
-                }
-                for k in ("server", "content-type", "content-length",
-                          "x-powered-by", "set-cookie", "location",
-                          "strict-transport-security"):
-                    if k in headers:
-                        http_info[k] = headers[k]
-
-                if b"<html" in body.lower() or b"<title" in body.lower():
-                    result["title"] = _extract_title(body)
-
-                result["http"] = http_info
-            except Exception as e:
-                result["http"] = {"parse_error": str(e), "raw_size": len(data)}
-        else:
-            result["http"] = {"raw_size": len(data), "note": "No HTTP header delimiter"}
-
-    except socks.ProxyError as e:
-        result["error"] = f"Tor proxy error: {e}"
-    except socket.timeout:
-        result["error"] = f"Timeout after {timeout}s (Tor is slow or service down)"
-    except ConnectionRefusedError:
-        result["error"] = "Connection refused (service down?)"
-    except OSError as e:
-        result["error"] = f"Network error: {e}"
-    except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
-    finally:
-        if sock:
+        if sock is not None:
             try:
                 sock.close()
             except Exception:
@@ -665,15 +1370,904 @@ def grab_onion_banner(
     return result
 
 
-# ============================================================
-# BTC First-Seen Timestamp + Balance
-# ============================================================
+# ---------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------
 
-def btc_first_seen(address: str, timeout: float = 20.0) -> Dict:
-    """
-    Look up when a BTC address first appeared on the blockchain.
-    Tries Blockchair -> Blockstream (paginated) -> Blockchain.info.
-    """
+
+def _parse_http_headers(
+    header_bytes: bytes,
+) -> Tuple[str, Optional[int], Dict[str, str]]:
+
+    text = header_bytes.decode(
+        "iso-8859-1",
+        errors="replace",
+    )
+
+    lines = text.split("\r\n")
+
+    status_line = lines[0] if lines else ""
+
+    status_code = None
+
+    parts = status_line.split()
+
+    if len(parts) >= 2:
+        status_code = safe_int(parts[1])
+
+    headers: Dict[str, str] = {}
+
+    for line in lines[1:]:
+        if ":" not in line:
+            continue
+
+        key, value = line.split(
+            ":",
+            1,
+        )
+
+        headers[key.strip().lower()] = (
+            value.strip()
+        )
+
+    return (
+        status_line,
+        status_code,
+        headers,
+    )
+
+
+def _extract_title(
+    body: bytes,
+) -> Optional[str]:
+
+    try:
+        text = body.decode(
+            "utf-8",
+            errors="ignore",
+        )
+
+        match = re.search(
+            r"<title[^>]*>(.*?)</title>",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        if not match:
+            return None
+
+        title = html_mod.unescape(
+            match.group(1)
+        )
+
+        title = re.sub(
+            r"\s+",
+            " ",
+            title,
+        ).strip()
+
+        return title[:500] or None
+
+    except Exception:
+        return None
+
+
+def _security_header_analysis(
+    headers: Dict[str, str],
+    scheme: str,
+) -> Dict[str, Any]:
+
+    present = {}
+    missing = []
+
+    for header, label in SECURITY_HEADERS.items():
+        if header in headers:
+            present[label] = headers[header]
+        else:
+            missing.append(label)
+
+    score = 100
+
+    for header in missing:
+        if header == "HSTS" and scheme == "https":
+            score -= 20
+        elif header in (
+            "CSP",
+            "X-Frame-Options",
+            "X-Content-Type-Options",
+        ):
+            score -= 15
+        else:
+            score -= 5
+
+    if scheme != "https":
+        score -= 20
+
+    return {
+        "score": max(0, min(100, score)),
+        "present": present,
+        "missing": missing,
+    }
+
+
+def _technology_fingerprint(
+    body: bytes,
+    headers: Dict[str, str],
+) -> List[Dict[str, Any]]:
+
+    text = body.decode(
+        "utf-8",
+        errors="ignore",
+    )
+
+    combined = (
+        text[:200000]
+        + "\n"
+        + "\n".join(
+            f"{k}: {v}"
+            for k, v in headers.items()
+        )
+    )
+
+    findings = []
+
+    for technology, signatures in (
+        COMMON_TECH_SIGNATURES.items()
+    ):
+        matches = []
+
+        for signature in signatures:
+            try:
+                if re.search(
+                    signature,
+                    combined,
+                    flags=re.IGNORECASE,
+                ):
+                    matches.append(signature)
+            except re.error:
+                continue
+
+        if matches:
+            findings.append(
+                {
+                    "technology": technology,
+                    "confidence": min(
+                        95,
+                        50 + len(matches) * 15,
+                    ),
+                    "evidence": matches,
+                }
+            )
+
+    return findings
+
+
+# ---------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------
+
+
+def _parse_tls_certificate(
+    der: bytes,
+) -> Dict[str, Any]:
+
+    info: Dict[str, Any] = {
+        "sha256_fp": hashlib.sha256(
+            der
+        ).hexdigest(),
+
+        "sha1_fp": hashlib.sha1(
+            der
+        ).hexdigest(),
+
+        "cert_size": len(der),
+    }
+
+    if not CRYPTOGRAPHY_AVAILABLE:
+        info["parser"] = "openssl/native"
+        return info
+
+    try:
+        certificate = (
+            x509.load_der_x509_certificate(
+                der,
+                default_backend(),
+            )
+        )
+
+        info["subject"] = (
+            certificate.subject.rfc4514_string()
+        )
+
+        info["issuer"] = (
+            certificate.issuer.rfc4514_string()
+        )
+
+        info["serial"] = str(
+            certificate.serial_number
+        )
+
+        info["version"] = (
+            str(certificate.version)
+        )
+
+        try:
+            san = certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            )
+
+            info["san"] = [
+                str(value)
+                for value in san.value
+            ]
+
+        except Exception:
+            info["san"] = []
+
+        not_before = (
+            certificate.not_valid_before_utc
+            if hasattr(
+                certificate,
+                "not_valid_before_utc",
+            )
+            else certificate.not_valid_before.replace(
+                tzinfo=timezone.utc
+            )
+        )
+
+        not_after = (
+            certificate.not_valid_after_utc
+            if hasattr(
+                certificate,
+                "not_valid_after_utc",
+            )
+            else certificate.not_valid_after.replace(
+                tzinfo=timezone.utc
+            )
+        )
+
+        info["not_before"] = (
+            not_before.isoformat()
+        )
+
+        info["not_after"] = (
+            not_after.isoformat()
+        )
+
+        now = datetime.now(timezone.utc)
+
+        days = (
+            not_after - now
+        ).days
+
+        info["days_to_expiry"] = days
+        info["expired"] = days < 0
+
+        info["self_signed"] = (
+            certificate.subject
+            == certificate.issuer
+        )
+
+    except Exception as exc:
+        info["cert_error"] = str(exc)
+
+    return info
+
+
+# ---------------------------------------------------------------------
+# Onion reconnaissance
+# ---------------------------------------------------------------------
+
+
+def _parse_onion_target(
+    target: str,
+    port: int = 443,
+    use_ssl: bool = True,
+) -> Dict[str, Any]:
+
+    target = target.strip()
+
+    if "://" in target:
+        parsed = urllib.parse.urlsplit(
+            target
+        )
+
+        host = parsed.hostname
+
+        if not host:
+            raise ValueError(
+                "Unable to parse hostname."
+            )
+
+        scheme = parsed.scheme.lower()
+
+        use_ssl = scheme == "https"
+
+        actual_port = (
+            parsed.port
+            or (443 if use_ssl else 80)
+        )
+
+        path = parsed.path or "/"
+
+        if parsed.query:
+            path += f"?{parsed.query}"
+
+        return {
+            "host": host.lower(),
+            "port": actual_port,
+            "scheme": scheme,
+            "path": path,
+        }
+
+    parsed = urllib.parse.urlsplit(
+        f"//{target}",
+    )
+
+    host = parsed.hostname
+
+    if not host:
+        raise ValueError(
+            "Unable to parse hostname."
+        )
+
+    actual_port = (
+        parsed.port
+        or port
+    )
+
+    path = parsed.path or "/"
+
+    if parsed.query:
+        path += f"?{parsed.query}"
+
+    return {
+        "host": host.lower(),
+        "port": actual_port,
+        "scheme": (
+            "https"
+            if use_ssl
+            else "http"
+        ),
+        "path": path,
+    }
+
+
+def grab_onion_banner(
+    onion: str,
+    port: int = 443,
+    use_ssl: bool = True,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_body: int = MAX_HTTP_BODY,
+) -> Dict[str, Any]:
+
+    result: Dict[str, Any] = {
+        "target": onion,
+        "host": None,
+        "port": port,
+        "scheme": (
+            "https"
+            if use_ssl
+            else "http"
+        ),
+        "reachable": False,
+        "tls": None,
+        "http": None,
+        "title": None,
+        "security": None,
+        "technologies": [],
+        "iocs": None,
+        "error": None,
+        "timestamp": utc_now(),
+    }
+
+    if not SOCKS_AVAILABLE:
+        result["error"] = (
+            "pysocks not installed."
+        )
+        return result
+
+    try:
+        parsed = _parse_onion_target(
+            onion,
+            port=port,
+            use_ssl=use_ssl,
+        )
+
+        host = parsed["host"]
+        actual_port = parsed["port"]
+        scheme = parsed["scheme"]
+        path = parsed["path"]
+
+        result["host"] = host
+        result["port"] = actual_port
+        result["scheme"] = scheme
+
+        if not (
+            ONION_V3_REGEX.fullmatch(host)
+            or ONION_V2_REGEX.fullmatch(host)
+        ):
+            result["error"] = (
+                f"Invalid onion hostname: {host}"
+            )
+            return result
+
+        sock = _tor_socket(timeout)
+
+        try:
+            sock.connect(
+                (host, actual_port)
+            )
+
+            result["reachable"] = True
+
+            stream = sock
+
+            if scheme == "https":
+                context = (
+                    ssl.create_default_context()
+                )
+
+                context.check_hostname = False
+                context.verify_mode = (
+                    ssl.CERT_NONE
+                )
+
+                stream = context.wrap_socket(
+                    sock,
+                    server_hostname=host,
+                )
+
+                tls = {
+                    "version": stream.version(),
+                    "cipher": stream.cipher(),
+                }
+
+                try:
+                    der = (
+                        stream.getpeercert(
+                            binary_form=True
+                        )
+                    )
+
+                    if der:
+                        tls.update(
+                            _parse_tls_certificate(
+                                der
+                            )
+                        )
+
+                except Exception as exc:
+                    tls["cert_error"] = str(
+                        exc
+                    )
+
+                result["tls"] = tls
+
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: {USER_AGENT}\r\n"
+                "Accept: text/html,application/xhtml+xml,"
+                "application/xml;q=0.9,*/*;q=0.8\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            )
+
+            stream.sendall(
+                request.encode()
+            )
+
+            chunks = []
+            total = 0
+
+            while total < max_body:
+                try:
+                    chunk = stream.recv(
+                        min(8192, max_body - total)
+                    )
+                except socket.timeout:
+                    break
+
+                if not chunk:
+                    break
+
+                chunks.append(chunk)
+                total += len(chunk)
+
+            raw = b"".join(chunks)
+
+            if b"\r\n\r\n" not in raw:
+                result["http"] = {
+                    "raw_size": len(raw),
+                    "error": (
+                        "No HTTP header delimiter."
+                    ),
+                }
+                return result
+
+            header_bytes, body = raw.split(
+                b"\r\n\r\n",
+                1,
+            )
+
+            (
+                status_line,
+                status_code,
+                headers,
+            ) = _parse_http_headers(
+                header_bytes
+            )
+
+            # Don't expose complete cookies.
+            safe_headers = dict(headers)
+
+            if "set-cookie" in safe_headers:
+                safe_headers["set-cookie"] = (
+                    "[redacted]"
+                )
+
+            http_info = {
+                "status": status_line,
+                "status_code": status_code,
+                "headers": safe_headers,
+                "body_size": len(body),
+                "content_type": headers.get(
+                    "content-type"
+                ),
+                "server": headers.get(
+                    "server"
+                ),
+                "location": headers.get(
+                    "location"
+                ),
+            }
+
+            result["http"] = http_info
+
+            result["title"] = _extract_title(
+                body
+            )
+
+            result["security"] = (
+                _security_header_analysis(
+                    headers,
+                    scheme,
+                )
+            )
+
+            result["technologies"] = (
+                _technology_fingerprint(
+                    body,
+                    headers,
+                )
+            )
+
+            result["iocs"] = extract_iocs(
+                body.decode(
+                    "utf-8",
+                    errors="ignore",
+                )
+            )
+
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    except Exception as exc:
+        result["error"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# Redirect analysis
+# ---------------------------------------------------------------------
+
+
+def analyze_redirects(
+    target: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_redirects: int = MAX_REDIRECTS,
+    through_tor: bool = False,
+) -> Dict[str, Any]:
+
+    result = {
+        "target": target,
+        "chain": [],
+        "final_url": None,
+        "redirect_count": 0,
+        "error": None,
+    }
+
+    if not REQUESTS_AVAILABLE:
+        result["error"] = (
+            "requests not installed."
+        )
+        return result
+
+    proxies = (
+        {
+            "http": TOR_HTTP_PROXY,
+            "https": TOR_HTTP_PROXY,
+        }
+        if through_tor and SOCKS_AVAILABLE
+        else None
+    )
+
+    current = target
+
+    for _ in range(max_redirects + 1):
+        try:
+            response = requests.get(
+                current,
+                timeout=timeout,
+                allow_redirects=False,
+                proxies=proxies,
+                headers={
+                    "User-Agent": USER_AGENT
+                },
+            )
+
+            location = response.headers.get(
+                "location"
+            )
+
+            entry = {
+                "url": current,
+                "status_code": response.status_code,
+                "location": location,
+            }
+
+            result["chain"].append(entry)
+
+            if not location:
+                result["final_url"] = current
+                break
+
+            current = urllib.parse.urljoin(
+                current,
+                location,
+            )
+
+            result["redirect_count"] += 1
+
+        except Exception as exc:
+            result["error"] = str(exc)
+            break
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# Domain / DNS intelligence
+# ---------------------------------------------------------------------
+
+
+def domain_intelligence(
+    domain: str,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+
+    domain = normalize_domain(domain)
+
+    result: Dict[str, Any] = {
+        "domain": domain,
+        "valid": bool(
+            DOMAIN_REGEX.fullmatch(domain)
+        ),
+        "records": {},
+        "error": None,
+        "timestamp": utc_now(),
+    }
+
+    if not result["valid"]:
+        result["error"] = (
+            "Invalid domain."
+        )
+        return result
+
+    if not DNS_AVAILABLE:
+        result["error"] = (
+            "dnspython not installed."
+        )
+        return result
+
+    record_types = (
+        "A",
+        "AAAA",
+        "MX",
+        "NS",
+        "TXT",
+        "CNAME",
+        "SOA",
+    )
+
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
+
+    for record_type in record_types:
+        try:
+            answers = resolver.resolve(
+                domain,
+                record_type,
+            )
+
+            values = []
+
+            for answer in answers:
+                values.append(
+                    str(answer)
+                )
+
+            result["records"][
+                record_type
+            ] = values
+
+        except Exception:
+            result["records"][
+                record_type
+            ] = []
+
+    txt_records = result[
+        "records"
+    ].get("TXT", [])
+
+    txt_joined = " ".join(
+        txt_records
+    ).lower()
+
+    result["email_security"] = {
+        "spf": "v=spf1" in txt_joined,
+        "dmarc_hint": False,
+    }
+
+    try:
+        dmarc = resolver.resolve(
+            f"_dmarc.{domain}",
+            "TXT",
+        )
+
+        result["email_security"][
+            "dmarc_hint"
+        ] = any(
+            "v=dmarc1"
+            in str(record).lower()
+            for record in dmarc
+        )
+
+    except Exception:
+        pass
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# Email intelligence
+# ---------------------------------------------------------------------
+
+
+def email_intelligence(
+    email: str,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+
+    email = email.strip().lower()
+
+    detection = detect_target_type(
+        email
+    )
+
+    if detection["type"] != "email":
+        return {
+            "email": email,
+            "valid": False,
+            "error": "Invalid email address.",
+        }
+
+    domain = detection[
+        "metadata"
+    ]["domain"]
+
+    result = {
+        "email": email,
+        "valid": True,
+        "domain": domain,
+        "disposable": (
+            domain in DISPOSABLE_DOMAINS
+        ),
+        "domain_intelligence": None,
+        "timestamp": utc_now(),
+    }
+
+    result["domain_intelligence"] = (
+        domain_intelligence(
+            domain,
+            timeout=timeout,
+        )
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# Ahmia
+# ---------------------------------------------------------------------
+
+
+def ahmia_search(
+    query: str,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+
+    if not REQUESTS_AVAILABLE:
+        return {
+            "error": (
+                "requests not installed."
+            )
+        }
+
+    query = query.strip()
+
+    if not query:
+        return {
+            "error": "Empty search query."
+        }
+
+    try:
+        response = requests.get(
+            AHMIA_SEARCH
+            + urllib.parse.quote_plus(query),
+            timeout=timeout,
+            headers={
+                "User-Agent": USER_AGENT
+            },
+        )
+
+        if response.status_code != 200:
+            return {
+                "error": (
+                    f"Ahmia returned HTTP "
+                    f"{response.status_code}"
+                )
+            }
+
+        links = extract_onion_links(
+            response.text
+        )
+
+        return {
+            "query": query,
+            "v3_links": links["v3"][:50],
+            "v2_links": links["v2"][:50],
+            "total": links["total"],
+            "source": "ahmia.fi",
+            "timestamp": utc_now(),
+        }
+
+    except Exception as exc:
+        return {
+            "error": (
+                f"Ahmia request failed: {exc}"
+            )
+        }
+
+
+# ---------------------------------------------------------------------
+# BTC intelligence
+# ---------------------------------------------------------------------
+
+
+def btc_first_seen(
+    address: str,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
+
     result: Dict[str, Any] = {
         "address": address,
         "valid": False,
@@ -689,602 +2283,1914 @@ def btc_first_seen(address: str, timeout: float = 20.0) -> Dict:
         "age_years": None,
         "source": None,
         "error": None,
+        "timestamp": utc_now(),
     }
 
+    address = address.strip()
+
     if not validate_btc_address(address):
-        result["error"] = "Invalid BTC address (checksum failed)"
+        result["error"] = (
+            "Invalid BTC address."
+        )
         return result
+
     result["valid"] = True
 
     if not REQUESTS_AVAILABLE:
-        result["error"] = "requests not installed (pip install requests)"
+        result["error"] = (
+            "requests not installed."
+        )
         return result
 
-    proxies = {"http": TOR_HTTP_PROXY, "https": TOR_HTTP_PROXY} if SOCKS_AVAILABLE else None
-    headers = {"User-Agent": "SpectraScan/1.0"}
+    proxies = (
+        {
+            "http": TOR_HTTP_PROXY,
+            "https": TOR_HTTP_PROXY,
+        }
+        if SOCKS_AVAILABLE
+        else None
+    )
 
-    def _age(ts: int) -> None:
-        result["age_days"] = int((time.time() - ts) / 86400)
-        result["age_years"] = round(result["age_days"] / 365.25, 2)
+    headers = {
+        "User-Agent": USER_AGENT
+    }
 
-    # 1) Blockchair - returns first_seen_receiving directly
-    try:
-        r = requests.get(
-            f"{BLOCKCHAIR_API}/dashboards/address/{address}",
-            timeout=timeout, proxies=proxies, headers=headers,
+    def set_age(timestamp: int) -> None:
+        age_days = max(
+            0,
+            int(
+                (
+                    time.time()
+                    - timestamp
+                )
+                / 86400
+            ),
         )
-        if r.status_code == 200:
-            payload = r.json()
-            addr = payload.get("data", {}).get(address, {})
-            addr_meta = addr.get("address", {})
-            chain = addr.get("chain_stats", {})
 
-            fs = addr_meta.get("first_seen_receiving")
-            if fs:
-                result["first_seen"] = fs
+        result["age_days"] = age_days
+        result["age_years"] = round(
+            age_days / 365.25,
+            2,
+        )
+
+    # Blockchair
+    try:
+        response = requests.get(
+            f"{BLOCKCHAIR_API}/dashboards/address/"
+            f"{address}",
+            timeout=timeout,
+            proxies=proxies,
+            headers=headers,
+        )
+
+        if response.status_code == 200:
+            payload = response.json()
+
+            data = payload.get(
+                "data",
+                {},
+            ).get(
+                address,
+                {},
+            )
+
+            address_meta = data.get(
+                "address",
+                {},
+            )
+
+            chain = data.get(
+                "chain_stats",
+                {},
+            )
+
+            first_seen = address_meta.get(
+                "first_seen_receiving"
+            )
+
+            if first_seen:
+                result["first_seen"] = (
+                    first_seen
+                )
+
                 try:
-                    dt = datetime.strptime(fs, "%Y-%m-%d %H:%M:%S")
-                    result["first_seen_timestamp"] = int(dt.timestamp())
+                    parsed = datetime.strptime(
+                        first_seen,
+                        "%Y-%m-%d %H:%M:%S",
+                    ).replace(
+                        tzinfo=timezone.utc
+                    )
+
+                    timestamp = int(
+                        parsed.timestamp()
+                    )
+
+                    result[
+                        "first_seen_timestamp"
+                    ] = timestamp
+
+                    set_age(timestamp)
+
                 except Exception:
                     pass
-            ls = addr_meta.get("last_seen_receiving")
-            if ls:
-                result["last_seen"] = ls
 
-            funded = chain.get("funded_txo_sum") or 0
-            spent = chain.get("spent_txo_sum") or 0
-            result["tx_count"] = chain.get("tx_count")
-            result["total_received_btc"] = funded / 1e8
-            result["total_sent_btc"] = spent / 1e8
-            result["balance_btc"] = (funded - spent) / 1e8
-            result["source"] = "blockchair.com"
+            result["last_seen"] = (
+                address_meta.get(
+                    "last_seen_receiving"
+                )
+            )
 
-            if result["first_seen_timestamp"]:
-                _age(result["first_seen_timestamp"])
+            funded = (
+                chain.get(
+                    "funded_txo_sum"
+                )
+                or 0
+            )
+
+            spent = (
+                chain.get(
+                    "spent_txo_sum"
+                )
+                or 0
+            )
+
+            result["tx_count"] = (
+                chain.get("tx_count")
+            )
+
+            result[
+                "total_received_btc"
+            ] = funded / 1e8
+
+            result[
+                "total_sent_btc"
+            ] = spent / 1e8
+
+            result[
+                "balance_btc"
+            ] = (funded - spent) / 1e8
+
+            result["source"] = (
+                "blockchair"
+            )
+
             return result
+
     except Exception:
         pass
 
-    # 2) Blockstream - paginate to find the oldest tx
+    # Blockstream
     try:
         first_tx = None
-        last_txid = None
-        for _ in range(20):  # safety cap
-            url = f"{BLOCKSTREAM_API}/address/{address}/txs"
-            if last_txid:
-                url += f"/chain/{last_txid}"
-            r = requests.get(url, timeout=timeout, proxies=proxies, headers=headers)
-            if r.status_code != 200:
+        cursor = None
+
+        for _ in range(20):
+            url = (
+                f"{BLOCKSTREAM_API}/address/"
+                f"{address}/txs"
+            )
+
+            if cursor:
+                url += (
+                    f"/chain/{cursor}"
+                )
+
+            response = requests.get(
+                url,
+                timeout=timeout,
+                proxies=proxies,
+                headers=headers,
+            )
+
+            if response.status_code != 200:
                 break
-            txs = r.json()
-            if not txs:
+
+            transactions = response.json()
+
+            if not transactions:
                 break
-            if first_tx is None:
-                first_tx = txs[-1]  # last in newest-first page = oldest
-            if len(txs) < 25:
+
+            first_tx = transactions[-1]
+
+            if len(transactions) < 25:
                 break
-            last_txid = txs[-1]["txid"]
+
+            cursor = transactions[
+                -1
+            ].get("txid")
+
+            if not cursor:
+                break
 
         if first_tx:
-            status = first_tx.get("status", {})
-            ts = status.get("block_time")
-            if ts:
-                result["first_seen_timestamp"] = ts
-                result["first_seen"] = datetime.utcfromtimestamp(ts).strftime(
-                    "%Y-%m-%d %H:%M:%S UTC"
-                )
-                _age(ts)
-            result["first_seen_block"] = status.get("block_height")
+            status = first_tx.get(
+                "status",
+                {},
+            )
 
-        # Chain stats (single call)
-        r = requests.get(
-            f"{BLOCKSTREAM_API}/address/{address}",
-            timeout=timeout, proxies=proxies, headers=headers,
-        )
-        if r.status_code == 200:
-            stats = r.json()
-            chain = stats.get("chain_stats", {})
-            funded = chain.get("funded_txo_sum") or 0
-            spent = chain.get("spent_txo_sum") or 0
-            result["tx_count"] = chain.get("tx_count")
-            result["total_received_btc"] = funded / 1e8
-            result["total_sent_btc"] = spent / 1e8
-            result["balance_btc"] = (funded - spent) / 1e8
-            result["source"] = "blockstream.info"
-        return result
-    except Exception:
-        pass
+            block_time = status.get(
+                "block_time"
+            )
 
-    # 3) Blockchain.info fallback
-    try:
-        r = requests.get(
-            f"{BLOCKCHAIN_INFO}/rawaddr/{address}?limit=50",
-            timeout=timeout, proxies=proxies, headers=headers,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            txs = data.get("txs", [])
-            if txs:
-                first_tx = txs[-1]
-                ts = first_tx.get("time")
-                if ts:
-                    result["first_seen_timestamp"] = ts
-                    result["first_seen"] = datetime.utcfromtimestamp(ts).strftime(
-                        "%Y-%m-%d %H:%M:%S UTC"
-                    )
-                    _age(ts)
-                result["first_seen_block"] = (
-                    first_tx.get("block_index") or first_tx.get("block_height")
+            if block_time:
+                result[
+                    "first_seen_timestamp"
+                ] = block_time
+
+                result["first_seen"] = (
+                    datetime.fromtimestamp(
+                        block_time,
+                        timezone.utc,
+                    ).isoformat()
                 )
-            result["total_received_btc"] = data.get("total_received", 0)
-            result["total_sent_btc"] = data.get("total_sent", 0)
-            result["balance_btc"] = data.get("final_balance", 0)
-            result["tx_count"] = data.get("n_tx", 0)
-            result["source"] = "blockchain.info"
+
+                set_age(block_time)
+
+            result[
+                "first_seen_block"
+            ] = status.get(
+                "block_height"
+            )
+
+        response = requests.get(
+            f"{BLOCKSTREAM_API}/address/"
+            f"{address}",
+            timeout=timeout,
+            proxies=proxies,
+            headers=headers,
+        )
+
+        if response.status_code == 200:
+            stats = response.json()
+
+            chain = stats.get(
+                "chain_stats",
+                {},
+            )
+
+            funded = (
+                chain.get(
+                    "funded_txo_sum"
+                )
+                or 0
+            )
+
+            spent = (
+                chain.get(
+                    "spent_txo_sum"
+                )
+                or 0
+            )
+
+            result["tx_count"] = (
+                chain.get("tx_count")
+            )
+
+            result[
+                "total_received_btc"
+            ] = funded / 1e8
+
+            result[
+                "total_sent_btc"
+            ] = spent / 1e8
+
+            result[
+                "balance_btc"
+            ] = (funded - spent) / 1e8
+
+            result["source"] = (
+                "blockstream"
+            )
+
             return result
+
     except Exception:
         pass
 
-    result["error"] = "All BTC lookup APIs failed (check connectivity)"
+    # Blockchain.info
+    try:
+        response = requests.get(
+            f"{BLOCKCHAIN_INFO}/rawaddr/"
+            f"{address}?limit=50",
+            timeout=timeout,
+            proxies=proxies,
+            headers=headers,
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+
+            transactions = data.get(
+                "txs",
+                [],
+            )
+
+            if transactions:
+                first_tx = transactions[-1]
+
+                timestamp = first_tx.get(
+                    "time"
+                )
+
+                if timestamp:
+                    result[
+                        "first_seen_timestamp"
+                    ] = timestamp
+
+                    result["first_seen"] = (
+                        datetime.fromtimestamp(
+                            timestamp,
+                            timezone.utc,
+                        ).isoformat()
+                    )
+
+                    set_age(timestamp)
+
+                result[
+                    "first_seen_block"
+                ] = (
+                    first_tx.get(
+                        "block_index"
+                    )
+                    or first_tx.get(
+                        "block_height"
+                    )
+                )
+
+            result[
+                "total_received_btc"
+            ] = (
+                data.get(
+                    "total_received",
+                    0,
+                )
+                / 1e8
+            )
+
+            result[
+                "total_sent_btc"
+            ] = (
+                data.get(
+                    "total_sent",
+                    0,
+                )
+                / 1e8
+            )
+
+            result[
+                "balance_btc"
+            ] = (
+                data.get(
+                    "final_balance",
+                    0,
+                )
+                / 1e8
+            )
+
+            result["tx_count"] = data.get(
+                "n_tx",
+                0,
+            )
+
+            result["source"] = (
+                "blockchain.info"
+            )
+
+            return result
+
+    except Exception:
+        pass
+
+    result["error"] = (
+        "All BTC APIs failed."
+    )
+
     return result
 
 
-def score_btc_risk(btc_data: Dict) -> Dict:
-    """Heuristic risk scoring for a BTC address (0-100, higher = riskier)."""
-    risk = {"score": 0, "factors": [], "level": "UNKNOWN"}
+# ---------------------------------------------------------------------
+# Risk scoring
+# ---------------------------------------------------------------------
+
+
+def score_btc_risk(
+    btc_data: Dict[str, Any],
+) -> Dict[str, Any]:
+
+    risk = {
+        "score": 0,
+        "level": "LOW",
+        "confidence": 50,
+        "factors": [],
+    }
+
     if not btc_data.get("valid"):
+        risk["level"] = "UNKNOWN"
+        risk["confidence"] = 0
         return risk
 
-    age = btc_data.get("age_days")
+    age = btc_data.get(
+        "age_days"
+    )
+
+    tx_count = (
+        btc_data.get("tx_count")
+        or 0
+    )
+
+    balance = (
+        btc_data.get("balance_btc")
+        or 0
+    )
+
     if age is not None:
         if age < 1:
             risk["score"] += 30
-            risk["factors"].append(f"Brand new address ({age}d old)")
+            risk["factors"].append(
+                "Address first observed less than 1 day ago."
+            )
+
         elif age < 7:
             risk["score"] += 15
-            risk["factors"].append(f"Very new address ({age}d old)")
+            risk["factors"].append(
+                "Very recently observed address."
+            )
+
         elif age < 30:
             risk["score"] += 5
-            risk["factors"].append(f"Recent address ({age}d old)")
+            risk["factors"].append(
+                "Recently observed address."
+            )
 
-    tx_count = btc_data.get("tx_count") or 0
-    if tx_count > 1000:
-        risk["score"] -= 10
-        risk["factors"].append(f"High tx count ({tx_count}) — likely service/exchange")
-    elif tx_count == 0:
+    if tx_count == 0:
         risk["score"] += 5
-        risk["factors"].append("No transactions yet (watch-only / unused)")
+        risk["factors"].append(
+            "No observed transactions."
+        )
 
-    balance = btc_data.get("balance_btc") or 0
+    elif tx_count > 1000:
+        risk["score"] -= 10
+        risk["factors"].append(
+            "High transaction volume; "
+            "could represent a service or exchange."
+        )
+
     if balance > 10 and tx_count < 5:
         risk["score"] += 10
         risk["factors"].append(
-            f"Dormant high-balance wallet ({balance} BTC, {tx_count} txs)"
+            "High balance with low transaction count."
         )
 
-    risk["score"] = max(0, min(100, risk["score"]))
+    risk["score"] = max(
+        0,
+        min(
+            100,
+            risk["score"],
+        ),
+    )
 
     if risk["score"] >= 60:
         risk["level"] = "HIGH"
+
     elif risk["score"] >= 30:
         risk["level"] = "MEDIUM"
+
     else:
         risk["level"] = "LOW"
+
+    risk["confidence"] = min(
+        95,
+        50 + len(
+            risk["factors"]
+        ) * 10,
+    )
 
     return risk
 
 
-# ============================================================
-# Onion Link Extractor
-# ============================================================
+def calculate_target_risk(
+    detection: Dict[str, Any],
+    recon: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
 
-def extract_onion_links(text: str) -> Dict:
-    """Extract .onion v2 and v3 links from arbitrary text."""
-    v3 = list({m.group(0).lower() for m in ONION_V3_REGEX.finditer(text)})
-    v2 = list({m.group(0).lower() for m in ONION_V2_REGEX.finditer(text)})
-    return {"v3": sorted(v3), "v2": sorted(v2), "total": len(v3) + len(v2)}
+    score = 0
+    factors: List[str] = []
 
-
-# ============================================================
-# Ahmia Dark Web Search
-# ============================================================
-
-def ahmia_search(query: str, timeout: float = 15.0) -> Dict:
-    """Search Ahmia.fi (clearnet) for .onion results."""
-    if not REQUESTS_AVAILABLE:
-        return {"error": "requests not installed"}
-    try:
-        r = requests.get(
-            AHMIA_SEARCH + urllib.parse.quote(query),
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0 SpectraScan/1.0"},
-        )
-        if r.status_code != 200:
-            return {"error": f"Ahmia returned HTTP {r.status_code}"}
-        links = extract_onion_links(r.text)
+    if not detection.get("valid"):
         return {
-            "query": query,
-            "v3_links": links["v3"][:30],
-            "v2_links": links["v2"][:30],
-            "total": links["total"],
-            "source": "ahmia.fi",
+            "score": 0,
+            "level": "UNKNOWN",
+            "confidence": 0,
+            "factors": [],
         }
-    except Exception as e:
-        return {"error": f"Ahmia request failed: {e}"}
 
+    target_type = detection.get(
+        "type"
+    )
 
-# ============================================================
-# Display Helpers
-# ============================================================
+    warnings = detection.get(
+        "warnings",
+        [],
+    )
 
-def display_detection(detection: Dict) -> None:
-    """Pretty-print target detection."""
-    if detection.get("type") == "empty":
-        console.print("[red]No target provided.[/red]")
-        return
+    score += min(
+        len(warnings) * 5,
+        20,
+    )
 
-    t = detection["type"]
-    if t == "unknown":
-        console.print(Panel(
-            f"[red]Could not identify target type[/red]\n[dim]{detection['input']}[/dim]",
-            title="Detection", border_style="red"))
-        return
+    factors.extend(
+        warnings
+    )
 
-    color_map = {
-        "onion": "magenta", "crypto": "yellow", "email": "cyan",
-        "ipv4": "blue", "hash": "green", "domain": "cyan",
-        "phone": "white", "username": "white", "pgp_key": "green",
+    if target_type == "onion":
+        score += 10
+        factors.append(
+            "Target is a Tor onion service."
+        )
+
+        if detection.get(
+            "subtype"
+        ) == "v2":
+            score += 20
+            factors.append(
+                "Deprecated onion v2 service."
+            )
+
+    elif target_type == "email":
+        if detection.get(
+            "metadata",
+            {},
+        ).get("disposable"):
+            score += 25
+            factors.append(
+                "Disposable email domain."
+            )
+
+    elif target_type == "domain":
+        tld = detection.get(
+            "metadata",
+            {},
+        ).get("tld")
+
+        if tld in SUSPICIOUS_TLDS:
+            score += 15
+            factors.append(
+                f"Abuse-prone TLD: .{tld}"
+            )
+
+    if recon:
+        security = recon.get(
+            "security"
+        )
+
+        if security:
+            security_score = (
+                security.get(
+                    "score",
+                    100,
+                )
+            )
+
+            if security_score < 50:
+                score += 15
+                factors.append(
+                    "Weak HTTP security-header posture."
+                )
+
+        tls = recon.get("tls")
+
+        if tls and tls.get("expired"):
+            score += 20
+            factors.append(
+                "Expired TLS certificate."
+            )
+
+    score = max(
+        0,
+        min(
+            100,
+            score,
+        ),
+    )
+
+    if score >= 60:
+        level = "HIGH"
+    elif score >= 30:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+
+    return {
+        "score": score,
+        "level": level,
+        "confidence": min(
+            95,
+            50 + len(factors) * 8,
+        ),
+        "factors": factors,
     }
-    color = color_map.get(t, "white")
 
-    table = Table(title="Target Detection", border_style=color, show_header=False)
-    table.add_column("Field", style="bold")
+
+# ---------------------------------------------------------------------
+# Full target reconnaissance
+# ---------------------------------------------------------------------
+
+
+def full_recon(
+    target: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    perform_network: bool = True,
+) -> Dict[str, Any]:
+
+    started = time.time()
+
+    detection = detect_target_type(
+        target
+    )
+
+    report: Dict[str, Any] = {
+        "tool": "SpectraScan",
+        "module": MODULE_NAME,
+        "module_version": MODULE_VERSION,
+        "timestamp": utc_now(),
+        "target": target,
+        "detection": detection,
+        "recon": {},
+        "iocs": None,
+        "risk": None,
+        "errors": [],
+    }
+
+    if not detection.get("valid"):
+        report["risk"] = {
+            "score": 0,
+            "level": "UNKNOWN",
+            "confidence": 0,
+            "factors": [
+                "Target could not be validated."
+            ],
+        }
+
+        return report
+
+    target_type = detection["type"]
+    subtype = detection.get("subtype")
+
+    if not perform_network:
+        report["risk"] = (
+            calculate_target_risk(
+                detection
+            )
+        )
+        return report
+
+    try:
+        if target_type == "onion":
+            report["recon"] = (
+                grab_onion_banner(
+                    target,
+                    timeout=timeout,
+                )
+            )
+
+        elif target_type == "domain":
+            report["recon"] = (
+                domain_intelligence(
+                    target,
+                    timeout=timeout,
+                )
+            )
+
+        elif target_type == "url":
+            report["recon"] = (
+                analyze_redirects(
+                    target,
+                    timeout=timeout,
+                )
+            )
+
+        elif target_type == "email":
+            report["recon"] = (
+                email_intelligence(
+                    target,
+                    timeout=timeout,
+                )
+            )
+
+        elif (
+            target_type == "crypto"
+            and subtype == "btc"
+        ):
+            btc = btc_first_seen(
+                target,
+                timeout=timeout,
+            )
+
+            report["recon"] = btc
+
+            report["risk"] = (
+                score_btc_risk(btc)
+            )
+
+        elif target_type in (
+            "hash",
+            "username",
+            "phone",
+            "ipv4",
+            "ipv6",
+            "pgp_key",
+        ):
+            report["recon"] = {
+                "note": (
+                    "Target recognized. "
+                    "No intrusive lookup performed."
+                )
+            }
+
+    except Exception as exc:
+        report["errors"].append(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    if report["risk"] is None:
+        report["risk"] = (
+            calculate_target_risk(
+                detection,
+                report.get("recon"),
+            )
+        )
+
+    report["duration_seconds"] = round(
+        time.time() - started,
+        3,
+    )
+
+    return report
+
+
+# ---------------------------------------------------------------------
+# JSON reporting
+# ---------------------------------------------------------------------
+
+
+def save_json_report(
+    report: Dict[str, Any],
+    output_path: str,
+) -> str:
+
+    output_path = os.path.abspath(
+        os.path.expanduser(
+            output_path
+        )
+    )
+
+    directory = os.path.dirname(
+        output_path
+    )
+
+    if directory:
+        os.makedirs(
+            directory,
+            exist_ok=True,
+        )
+
+    with open(
+        output_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            report,
+            file,
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        )
+
+    return output_path
+
+
+# ---------------------------------------------------------------------
+# Display
+# ---------------------------------------------------------------------
+
+
+def display_detection(
+    detection: Dict[str, Any],
+) -> None:
+
+    if detection.get("type") == "empty":
+        console.print(
+            "[red]No target provided.[/red]"
+        )
+        return
+
+    target_type = detection.get(
+        "type",
+        "unknown",
+    )
+
+    if target_type == "unknown":
+        console.print(
+            Panel(
+                f"[red]Unknown target[/red]\n"
+                f"{detection.get('input', '')}",
+                title="Detection",
+                border_style="red",
+            )
+        )
+        return
+
+    colors = {
+        "onion": "magenta",
+        "crypto": "yellow",
+        "email": "cyan",
+        "ipv4": "blue",
+        "ipv6": "blue",
+        "hash": "green",
+        "domain": "cyan",
+        "url": "cyan",
+        "phone": "white",
+        "username": "white",
+        "pgp_key": "green",
+    }
+
+    color = colors.get(
+        target_type,
+        "white",
+    )
+
+    table = Table(
+        title="Target Detection",
+        border_style=color,
+        show_header=False,
+    )
+
+    table.add_column(
+        "Field",
+        style="bold",
+    )
+
     table.add_column("Value")
 
-    type_label = t.upper()
+    label = target_type.upper()
+
     if detection.get("subtype"):
-        type_label += f" ({detection['subtype'].upper()})"
-    table.add_row("Type", f"[{color}]{type_label}[/{color}]")
-    table.add_row("Confidence", f"{detection['confidence']}%")
-    table.add_row("Valid", "[green]Yes[/green]" if detection["valid"] else "[red]No[/red]")
+        label += (
+            f" ({detection['subtype'].upper()})"
+        )
 
-    for k, v in detection.get("metadata", {}).items():
-        if isinstance(v, list):
-            v = ", ".join(str(x) for x in v[:5])
-        table.add_row(k, str(v)[:80])
+    table.add_row(
+        "Type",
+        f"[{color}]{label}[/{color}]",
+    )
 
-    for w in detection.get("warnings", []):
-        table.add_row("[yellow]![/yellow]", f"[yellow]{w}[/yellow]")
+    table.add_row(
+        "Confidence",
+        f"{detection.get('confidence', 0)}%",
+    )
+
+    table.add_row(
+        "Valid",
+        (
+            "[green]YES[/green]"
+            if detection.get("valid")
+            else "[red]NO[/red]"
+        ),
+    )
+
+    if detection.get("normalized"):
+        table.add_row(
+            "Normalized",
+            detection["normalized"][:120],
+        )
+
+    for key, value in detection.get(
+        "metadata",
+        {},
+    ).items():
+
+        if isinstance(value, list):
+            value = ", ".join(
+                str(x)
+                for x in value[:5]
+            )
+
+        table.add_row(
+            key,
+            str(value)[:120],
+        )
+
+    for warning in detection.get(
+        "warnings",
+        [],
+    ):
+        table.add_row(
+            "[yellow]![/yellow]",
+            f"[yellow]{warning}[/yellow]",
+        )
 
     console.print(table)
 
 
-def display_onion_banner(banner: Dict) -> None:
-    """Pretty-print onion banner grab result."""
+def display_onion_banner(
+    banner: Dict[str, Any],
+) -> None:
+
     if banner.get("error"):
-        console.print(Panel(
-            f"[red]{banner['error']}[/red]",
-            title=f"X  {banner.get('host', '?')}",
-            border_style="red"))
+        console.print(
+            Panel(
+                f"[red]{banner['error']}[/red]",
+                title=(
+                    f"Onion {banner.get('host', '?')}"
+                ),
+                border_style="red",
+            )
+        )
         return
 
-    t = Table(
-        title=f"Onion  {banner['host']}:{banner['port']} ({banner['scheme'].upper()})",
-        border_style="magenta", show_header=False,
+    table = Table(
+        title=(
+            f"Onion Recon — "
+            f"{banner.get('host', '?')}:"
+            f"{banner.get('port', '?')}"
+        ),
+        border_style="magenta",
+        show_header=False,
     )
-    t.add_column("Field", style="bold magenta")
-    t.add_column("Value")
-    t.add_row("Reachable",
-              "[green]OK[/green]" if banner["reachable"] else "[red]NO[/red]")
+
+    table.add_column(
+        "Field",
+        style="bold magenta",
+    )
+
+    table.add_column("Value")
+
+    table.add_row(
+        "Reachable",
+        (
+            "[green]YES[/green]"
+            if banner.get("reachable")
+            else "[red]NO[/red]"
+        ),
+    )
+
+    table.add_row(
+        "Scheme",
+        str(
+            banner.get(
+                "scheme",
+                "?",
+            )
+        ).upper(),
+    )
 
     if banner.get("title"):
-        t.add_row("Title", f"[cyan]{banner['title']}[/cyan]")
+        table.add_row(
+            "Title",
+            banner["title"],
+        )
 
-    if banner.get("tls"):
-        tls = banner["tls"]
-        if "version" in tls:
-            t.add_row("TLS Version", tls["version"])
-        if "cipher" in tls and tls["cipher"]:
-            t.add_row("Cipher", str(tls["cipher"]))
-        if "sha256_fp" in tls:
-            t.add_row("Cert SHA-256", f"[dim]{tls['sha256_fp'][:32]}...[/dim]")
-        if "subject" in tls:
-            t.add_row("Subject", tls["subject"][:70])
-        if "issuer" in tls:
-            t.add_row("Issuer", tls["issuer"][:70])
-        if "san" in tls and tls["san"]:
-            t.add_row("SAN", ", ".join(tls["san"][:3]))
-        if "days_to_expiry" in tls:
-            days = tls["days_to_expiry"]
-            color = "red" if days < 0 else ("yellow" if days < 30 else "green")
-            label = f"[{color}]{days} days[/{color}]"
-            if tls.get("expired"):
-                label += " [red](EXPIRED)[/red]"
-            t.add_row("Cert Expiry", label)
-        if "cert_error" in tls:
-            t.add_row("Cert Error", f"[red]{tls['cert_error']}[/red]")
+    tls = banner.get("tls")
 
-    if banner.get("http"):
-        http = banner["http"]
-        if "status_code" in http and http["status_code"]:
-            code = http["status_code"]
-            color = "green" if 200 <= code < 300 else (
-                "yellow" if 300 <= code < 400 else "red"
+    if tls:
+        if tls.get("version"):
+            table.add_row(
+                "TLS",
+                str(tls["version"]),
             )
-            t.add_row("HTTP Status",
-                      f"[{color}]{code}[/{color}]  [dim]{http.get('status', '')}[/dim]")
-        for k in ("server", "content-type", "x-powered-by", "location"):
-            if k in http:
-                t.add_row(k.title(), str(http[k])[:80])
-        if "body_size" in http:
-            t.add_row("Body Size", f"{http['body_size']:,} bytes")
 
-    console.print(t)
+        if tls.get("cipher"):
+            table.add_row(
+                "Cipher",
+                str(tls["cipher"]),
+            )
+
+        if tls.get("sha256_fp"):
+            table.add_row(
+                "Certificate SHA-256",
+                tls["sha256_fp"],
+            )
+
+        if tls.get("subject"):
+            table.add_row(
+                "Subject",
+                tls["subject"][:100],
+            )
+
+        if tls.get("issuer"):
+            table.add_row(
+                "Issuer",
+                tls["issuer"][:100],
+            )
+
+        if tls.get("days_to_expiry") is not None:
+            days = tls[
+                "days_to_expiry"
+            ]
+
+            color = (
+                "red"
+                if days < 0
+                else "yellow"
+                if days < 30
+                else "green"
+            )
+
+            table.add_row(
+                "Certificate Expiry",
+                f"[{color}]{days} days[/{color}]",
+            )
+
+    http = banner.get("http")
+
+    if http:
+        status = http.get(
+            "status_code"
+        )
+
+        if status:
+            color = (
+                "green"
+                if 200 <= status < 300
+                else "yellow"
+                if 300 <= status < 400
+                else "red"
+            )
+
+            table.add_row(
+                "HTTP",
+                f"[{color}]{status}[/{color}]",
+            )
+
+        if http.get("server"):
+            table.add_row(
+                "Server",
+                str(
+                    http["server"]
+                )[:100],
+            )
+
+        if http.get("content_type"):
+            table.add_row(
+                "Content-Type",
+                str(
+                    http["content_type"]
+                )[:100],
+            )
+
+        table.add_row(
+            "Body Size",
+            f"{http.get('body_size', 0):,} bytes",
+        )
+
+    security = banner.get(
+        "security"
+    )
+
+    if security:
+        table.add_row(
+            "Security Score",
+            f"{security.get('score', 0)}/100",
+        )
+
+    console.print(table)
+
+    technologies = banner.get(
+        "technologies",
+        [],
+    )
+
+    if technologies:
+        tech_table = Table(
+            title="Technology Fingerprint",
+            border_style="cyan",
+        )
+
+        tech_table.add_column(
+            "Technology"
+        )
+
+        tech_table.add_column(
+            "Confidence"
+        )
+
+        for item in technologies:
+            tech_table.add_row(
+                item["technology"],
+                f"{item['confidence']}%",
+            )
+
+        console.print(
+            tech_table
+        )
+
+    iocs = banner.get("iocs")
+
+    if iocs:
+        display_ioc_summary(iocs)
 
 
-def display_btc(data: Dict, risk: Optional[Dict] = None) -> None:
-    """Pretty-print BTC first-seen result."""
+def display_ioc_summary(
+    iocs: Dict[str, Any],
+) -> None:
+
+    counts = iocs.get(
+        "counts",
+        {},
+    )
+
+    table = Table(
+        title="IOC Summary",
+        border_style="green",
+    )
+
+    table.add_column("IOC")
+    table.add_column("Count")
+
+    labels = (
+        ("URLs", "urls"),
+        ("Onion", "onions"),
+        ("Domains", "domains"),
+        ("IPv4", "ipv4"),
+        ("IPv6", "ipv6"),
+        ("Emails", "emails"),
+        ("BTC", "btc"),
+        ("ETH", "eth"),
+        ("XMR", "xmr"),
+        ("LTC", "ltc"),
+        ("Hashes", "hashes"),
+        ("PGP", "pgp_blocks"),
+    )
+
+    for label, key in labels:
+        count = counts.get(
+            key,
+            0,
+        )
+
+        if count:
+            table.add_row(
+                label,
+                str(count),
+            )
+
+    console.print(table)
+
+
+def display_btc(
+    data: Dict[str, Any],
+    risk: Optional[Dict[str, Any]] = None,
+) -> None:
+
     if not data.get("valid"):
-        console.print(Panel(
-            f"[red]{data.get('error', 'Invalid BTC address')}[/red]",
-            title="BTC Lookup", border_style="red"))
+        console.print(
+            Panel(
+                f"[red]{data.get('error', 'Invalid BTC address')}[/red]",
+                title="BTC Intelligence",
+                border_style="red",
+            )
+        )
         return
 
-    t = Table(title=f"BTC  {data['address']}", border_style="yellow", show_header=False)
-    t.add_column("Field", style="bold yellow")
-    t.add_column("Value")
+    table = Table(
+        title=(
+            f"BTC Intelligence — "
+            f"{data['address']}"
+        ),
+        border_style="yellow",
+        show_header=False,
+    )
+
+    table.add_column(
+        "Field",
+        style="bold yellow",
+    )
+
+    table.add_column("Value")
 
     if data.get("first_seen"):
-        t.add_row("First Seen", f"[green]{data['first_seen']}[/green]")
-    if data.get("first_seen_timestamp"):
-        t.add_row("Timestamp", str(data["first_seen_timestamp"]))
-    if data.get("first_seen_block"):
-        t.add_row("First Block", f"#{data['first_seen_block']:,}")
-    if data.get("age_days") is not None:
-        t.add_row("Age",
-                  f"{data['age_days']:,} days  (~{data.get('age_years', 0)} years)")
-    if data.get("last_seen"):
-        t.add_row("Last Seen", data["last_seen"])
-
-    t.add_row("", "")
-    t.add_row("Tx Count", f"{data.get('tx_count', 0):,}")
-    t.add_row("Total Received", f"{data.get('total_received_btc', 0):.8f} BTC")
-    t.add_row("Total Sent", f"{data.get('total_sent_btc', 0):.8f} BTC")
-    bal = data.get("balance_btc", 0) or 0
-    bal_color = "green" if bal > 0 else "white"
-    t.add_row("Current Balance", f"[{bal_color}]{bal:.8f} BTC[/{bal_color}]")
-
-    t.add_row("", "")
-    t.add_row("[dim]Source[/dim]", f"[dim]{data.get('source', '?')}[/dim]")
-
-    console.print(t)
-
-    if risk and risk.get("factors"):
-        rt = Table(title="Risk Heuristics", border_style="red", show_header=False)
-        rt.add_column("Score", style="bold")
-        rt.add_column("Level")
-        rt.add_column("Factors")
-        level_color = {"HIGH": "red", "MEDIUM": "yellow", "LOW": "green"}.get(
-            risk["level"], "white")
-        rt.add_row(
-            str(risk["score"]),
-            f"[{level_color}]{risk['level']}[/{level_color}]",
-            "\n".join("- " + f for f in risk["factors"]),
+        table.add_row(
+            "First Seen",
+            str(data["first_seen"]),
         )
-        console.print(rt)
+
+    if data.get("first_seen_block"):
+        table.add_row(
+            "First Block",
+            f"#{data['first_seen_block']:,}",
+        )
+
+    if data.get("age_days") is not None:
+        table.add_row(
+            "Age",
+            f"{data['age_days']:,} days "
+            f"(~{data.get('age_years', 0)} years)",
+        )
+
+    table.add_row(
+        "Transactions",
+        f"{data.get('tx_count') or 0:,}",
+    )
+
+    table.add_row(
+        "Received",
+        f"{data.get('total_received_btc') or 0:.8f} BTC",
+    )
+
+    table.add_row(
+        "Sent",
+        f"{data.get('total_sent_btc') or 0:.8f} BTC",
+    )
+
+    table.add_row(
+        "Balance",
+        f"{data.get('balance_btc') or 0:.8f} BTC",
+    )
+
+    table.add_row(
+        "Source",
+        str(
+            data.get(
+                "source",
+                "unknown",
+            )
+        ),
+    )
+
+    console.print(table)
+
+    if risk:
+        color = {
+            "HIGH": "red",
+            "MEDIUM": "yellow",
+            "LOW": "green",
+        }.get(
+            risk.get("level"),
+            "white",
+        )
+
+        console.print(
+            Panel(
+                f"Score: [bold]{risk.get('score', 0)}/100[/bold]\n"
+                f"Level: [{color}]"
+                f"{risk.get('level', 'UNKNOWN')}"
+                f"[/{color}]\n"
+                f"Confidence: "
+                f"{risk.get('confidence', 0)}%",
+                title="BTC Risk Heuristics",
+                border_style=color,
+            )
+        )
+
+        for factor in risk.get(
+            "factors",
+            [],
+        ):
+            console.print(
+                f"  [yellow]•[/yellow] {factor}"
+            )
 
 
-# ============================================================
-# Menu
-# ============================================================
+# ---------------------------------------------------------------------
+# Menu helpers
+# ---------------------------------------------------------------------
 
-def _prompt(text: str, default: str = "") -> str:
-    s = Prompt.ask(f"[cyan]{text}[/cyan]", default=default)
-    return s.strip() if s else default
+
+def _prompt(
+    text: str,
+    default: str = "",
+) -> str:
+
+    value = Prompt.ask(
+        f"[cyan]{text}[/cyan]",
+        default=default,
+    )
+
+    return value.strip()
+
+
+def _save_report_interactive(
+    report: Dict[str, Any],
+) -> None:
+
+    path = _prompt(
+        "Output JSON path",
+        "spectrascan_darkweb_report.json",
+    )
+
+    try:
+        saved = save_json_report(
+            report,
+            path,
+        )
+
+        console.print(
+            f"[green]Report saved:[/green] "
+            f"{saved}"
+        )
+
+    except Exception as exc:
+        console.print(
+            f"[red]Unable to save report: "
+            f"{exc}[/red]"
+        )
+
+
+# ---------------------------------------------------------------------
+# Interactive menu
+# ---------------------------------------------------------------------
 
 
 def run_darkweb_menu() -> None:
-    """Main Dark Web Recon interactive menu."""
+    """
+    Main Dark Web Intelligence interactive menu.
+    """
+
+    console.print(
+        Panel(
+            f"[bold magenta]"
+            f"SPECTRASCAN DARK WEB INTELLIGENCE"
+            f"[/bold magenta]\n"
+            f"[dim]Module {MODULE_VERSION}[/dim]",
+            border_style="magenta",
+        )
+    )
+
     if not SOCKS_AVAILABLE:
         console.print(
-            "[yellow]![/yellow] pysocks not installed. .onion operations disabled.\n"
-            "    Install with: [cyan]pip install pysocks[/cyan]")
+            "[yellow]![/yellow] "
+            "PySocks unavailable — "
+            "Tor operations disabled."
+        )
+
     if not REQUESTS_AVAILABLE:
         console.print(
-            "[yellow]![/yellow] requests not installed. Clearnet API lookups disabled.\n"
-            "    Install with: [cyan]pip install requests[/cyan]")
+            "[yellow]![/yellow] "
+            "Requests unavailable — "
+            "HTTP/API operations disabled."
+        )
+
+    if not DNS_AVAILABLE:
+        console.print(
+            "[yellow]![/yellow] "
+            "dnspython unavailable — "
+            "DNS intelligence disabled."
+        )
 
     while True:
-        console.print(Panel("""
-[bold magenta]DARK WEB RECON MODULE[/bold magenta]
+        console.print(
+            Panel(
+                """
+[bold magenta]DARK WEB INTELLIGENCE[/bold magenta]
 
-[green]1.[/green]  Auto-Detect & Analyze Target
-[green]2.[/green]  HTTPS .onion Banner Grab
-[green]3.[/green]  BTC First-Seen Timestamp
-[green]4.[/green]  Extract .onion Links from Text
-[green]5.[/green]  Ahmia Dark Web Search
-[green]6.[/green]  Tor Connectivity Check
-[green]7.[/green]  Full Recon (auto-detect + analyze)
-[red]8.[/red]  Back
-        """, border_style="magenta"))
+[green]1.[/green]  Auto Detect Target
+[green]2.[/green]  Full Recon
+[green]3.[/green]  Onion Banner / Web Recon
+[green]4.[/green]  Extract IOCs
+[green]5.[/green]  BTC Intelligence
+[green]6.[/green]  Domain / DNS Intelligence
+[green]7.[/green]  Email Intelligence
+[green]8.[/green]  Ahmia Search
+[green]9.[/green]  Redirect Analysis
+[green]10.[/green] Tor Connectivity
+[green]11.[/green] Save JSON Report
+[red]12.[/red] Exit
+                """,
+                border_style="magenta",
+            )
+        )
 
         choice = Prompt.ask(
             "[bold magenta]Select option[/bold magenta]",
-            choices=["1", "2", "3", "4", "5", "6", "7", "8"], default="1")
+            choices=[
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9",
+                "10",
+                "11",
+                "12",
+            ],
+            default="1",
+        )
 
         try:
+            # ---------------------------------------------------------
+            # Detection
+            # ---------------------------------------------------------
+
             if choice == "1":
-                target = _prompt("Enter target")
+                target = _prompt(
+                    "Target"
+                )
+
                 if target:
-                    display_detection(detect_target_type(target))
+                    display_detection(
+                        detect_target_type(
+                            target
+                        )
+                    )
+
+            # ---------------------------------------------------------
+            # Full recon
+            # ---------------------------------------------------------
 
             elif choice == "2":
-                if not SOCKS_AVAILABLE:
-                    console.print("[red]pysocks required for .onion ops.[/red]")
-                    continue
-                onion = _prompt("Enter .onion URL or hostname")
-                if not onion:
-                    continue
-                port_s = _prompt("Port (443/80/8080)", "443")
-                try:
-                    port = int(port_s)
-                except ValueError:
-                    port = 443
-                use_ssl = Confirm.ask("Use HTTPS?", default=(port == 443))
-                with console.status(f"[magenta]Grabbing banner from {onion}...[/magenta]"):
-                    banner = grab_onion_banner(onion, port=port, use_ssl=use_ssl)
-                display_onion_banner(banner)
+                target = _prompt(
+                    "Target"
+                )
 
-            elif choice == "3":
-                addr = _prompt("Enter BTC address")
-                if not addr:
-                    continue
-                with console.status("[yellow]Querying blockchain APIs...[/yellow]"):
-                    data = btc_first_seen(addr)
-                    risk = score_btc_risk(data) if data.get("valid") else None
-                display_btc(data, risk)
-
-            elif choice == "4":
-                console.print("[dim]Paste text containing .onion links "
-                              "(press Enter twice to finish):[/dim]")
-                lines, empty = [], 0
-                try:
-                    while True:
-                        line = input()
-                        if not line:
-                            empty += 1
-                            if empty >= 2:
-                                break
-                            continue
-                        empty = 0
-                        lines.append(line)
-                except EOFError:
-                    pass
-                links = extract_onion_links("\n".join(lines))
-                console.print(
-                    f"[magenta]Found:[/magenta] "
-                    f"[green]{len(links['v3'])}[/green] v3, "
-                    f"[red]{len(links['v2'])}[/red] v2 (deprecated)")
-                if links["v3"]:
-                    console.print(Panel(
-                        "\n".join(links["v3"]),
-                        title="v3 Onion Links", border_style="magenta"))
-                if links["v2"]:
-                    console.print(Panel(
-                        "\n".join(links["v2"]),
-                        title="v2 Onion Links (DEPRECATED)",
-                        border_style="red"))
-
-            elif choice == "5":
-                query = _prompt("Search query")
-                if not query:
-                    continue
-                with console.status("[cyan]Querying Ahmia.fi...[/cyan]"):
-                    res = ahmia_search(query)
-                if res.get("error"):
-                    console.print(f"[red]{res['error']}[/red]")
-                else:
-                    console.print(f"[green]Found {res['total']} .onion links[/green]")
-                    if res["v3_links"]:
-                        console.print(Panel(
-                            "\n".join(res["v3_links"][:20]),
-                            title="v3 Results", border_style="magenta"))
-                    if res["v2_links"]:
-                        console.print(Panel(
-                            "\n".join(res["v2_links"][:20]),
-                            title="v2 Results (deprecated)",
-                            border_style="red"))
-
-            elif choice == "6":
-                with console.status("[magenta]Testing Tor connection...[/magenta]"):
-                    tor = check_tor_connection()
-                if tor.get("tor_working"):
-                    console.print(Panel(
-                        f"[green]Tor is working[/green]\n"
-                        f"Exit IP: [cyan]{tor['exit_ip']}[/cyan]",
-                        border_style="green"))
-                else:
-                    console.print(Panel(
-                        f"[red]Tor not working[/red]\n"
-                        f"{tor.get('error', '')}",
-                        border_style="red"))
-
-            elif choice == "7":
-                target = _prompt("Enter target (auto-detect + analyze)")
                 if not target:
                     continue
-                det = detect_target_type(target)
-                display_detection(det)
 
-                if not det.get("valid"):
+                with console.status(
+                    "[magenta]Running full reconnaissance...[/magenta]"
+                ):
+                    report = full_recon(
+                        target
+                    )
+
+                display_detection(
+                    report["detection"]
+                )
+
+                if report[
+                    "detection"
+                ]["type"] == "onion":
+                    display_onion_banner(
+                        report["recon"]
+                    )
+
+                elif (
+                    report[
+                        "detection"
+                    ]["subtype"]
+                    == "btc"
+                ):
+                    display_btc(
+                        report["recon"],
+                        report["risk"],
+                    )
+
+                else:
+                    console.print(
+                        Panel(
+                            json.dumps(
+                                report[
+                                    "recon"
+                                ],
+                                indent=2,
+                                default=str,
+                            )[:10000],
+                            title="Recon Result",
+                            border_style="cyan",
+                        )
+                    )
+
+                risk = report.get(
+                    "risk"
+                )
+
+                if risk:
+                    console.print(
+                        Panel(
+                            f"Risk: "
+                            f"[bold]{risk.get('level')}[/bold]\n"
+                            f"Score: "
+                            f"{risk.get('score')}/100\n"
+                            f"Confidence: "
+                            f"{risk.get('confidence')}%",
+                            title="Risk",
+                            border_style=(
+                                "red"
+                                if risk.get(
+                                    "level"
+                                ) == "HIGH"
+                                else "yellow"
+                            ),
+                        )
+                    )
+
+                if Confirm.ask(
+                    "Save JSON report?",
+                    default=False,
+                ):
+                    _save_report_interactive(
+                        report
+                    )
+
+            # ---------------------------------------------------------
+            # Onion
+            # ---------------------------------------------------------
+
+            elif choice == "3":
+                if not SOCKS_AVAILABLE:
+                    console.print(
+                        "[red]PySocks required.[/red]"
+                    )
                     continue
 
-                t = det["type"]
-                st = det.get("subtype")
+                target = _prompt(
+                    "Onion URL / hostname"
+                )
 
-                if t == "onion":
-                    port_s = _prompt("Port (443/80)", "443")
+                if not target:
+                    continue
+
+                with console.status(
+                    "[magenta]Performing onion reconnaissance...[/magenta]"
+                ):
+                    result = (
+                        grab_onion_banner(
+                            target
+                        )
+                    )
+
+                display_onion_banner(
+                    result
+                )
+
+            # ---------------------------------------------------------
+            # IOC
+            # ---------------------------------------------------------
+
+            elif choice == "4":
+                console.print(
+                    "[dim]Paste text. "
+                    "Press Enter twice to finish.[/dim]"
+                )
+
+                lines = []
+                empty_lines = 0
+
+                while True:
                     try:
-                        port = int(port_s)
-                    except ValueError:
-                        port = 443
-                    use_ssl = Confirm.ask("Use HTTPS?", default=(port == 443))
-                    with console.status(
-                        f"[magenta]Grabbing banner from {target}...[/magenta]"
-                    ):
-                        banner = grab_onion_banner(
-                            target, port=port, use_ssl=use_ssl)
-                    display_onion_banner(banner)
+                        line = input()
+                    except EOFError:
+                        break
 
-                elif t == "crypto" and st == "btc":
-                    with console.status("[yellow]Querying BTC...[/yellow]"):
-                        data = btc_first_seen(det["input"])
-                        risk = score_btc_risk(data)
-                    display_btc(data, risk)
+                    if not line:
+                        empty_lines += 1
 
-                elif t == "email":
-                    domain = det["metadata"].get("domain")
-                    console.print(f"[cyan]Email domain:[/cyan] {domain}")
-                    if domain and not det["metadata"].get("disposable"):
-                        with console.status("[cyan]Ahmia lookup...[/cyan]"):
-                            res = ahmia_search(domain)
-                        if res.get("v3_links"):
-                            console.print(
-                                f"[green]Found {len(res['v3_links'])} "
-                                f"related .onion links[/green]")
-                            for link in res["v3_links"][:10]:
-                                console.print(f"  [magenta]{link}[/magenta]")
-                        elif not res.get("error"):
-                            console.print("[yellow]No .onion hits on Ahmia.[/yellow]")
+                        if empty_lines >= 2:
+                            break
 
-                elif t == "domain":
-                    with console.status("[cyan]Ahmia lookup...[/cyan]"):
-                        res = ahmia_search(det["input"])
-                    if res.get("v3_links"):
-                        console.print(
-                            f"[green]Found {len(res['v3_links'])} .onion links[/green]")
-                        for link in res["v3_links"][:10]:
-                            console.print(f"  [magenta]{link}[/magenta]")
-                    elif not res.get("error"):
-                        console.print("[yellow]No .onion hits on Ahmia.[/yellow]")
+                        continue
 
-                elif t in ("crypto", "hash", "username", "phone", "ipv4", "pgp_key"):
+                    empty_lines = 0
+                    lines.append(line)
+
+                iocs = extract_iocs(
+                    "\n".join(lines)
+                )
+
+                display_ioc_summary(
+                    iocs
+                )
+
+                if Confirm.ask(
+                    "Show extracted values?",
+                    default=True,
+                ):
                     console.print(
-                        f"[cyan]Hint:[/cyan] For '{t}' targets, consider "
-                        "OSINT lookups (namechk, maigret, h8mail, etc.).")
+                        Panel(
+                            json.dumps(
+                                iocs,
+                                indent=2,
+                                ensure_ascii=False,
+                            ),
+                            title="Extracted IOCs",
+                            border_style="green",
+                        )
+                    )
+
+            # ---------------------------------------------------------
+            # BTC
+            # ---------------------------------------------------------
+
+            elif choice == "5":
+                address = _prompt(
+                    "BTC address"
+                )
+
+                if not address:
+                    continue
+
+                with console.status(
+                    "[yellow]Querying public blockchain data...[/yellow]"
+                ):
+                    data = btc_first_seen(
+                        address
+                    )
+
+                risk = (
+                    score_btc_risk(data)
+                    if data.get("valid")
+                    else None
+                )
+
+                display_btc(
+                    data,
+                    risk,
+                )
+
+            # ---------------------------------------------------------
+            # Domain
+            # ---------------------------------------------------------
+
+            elif choice == "6":
+                domain = _prompt(
+                    "Domain"
+                )
+
+                if not domain:
+                    continue
+
+                with console.status(
+                    "[cyan]Resolving DNS records...[/cyan]"
+                ):
+                    result = (
+                        domain_intelligence(
+                            domain
+                        )
+                    )
+
+                console.print(
+                    Panel(
+                        json.dumps(
+                            result,
+                            indent=2,
+                            default=str,
+                        ),
+                        title="Domain Intelligence",
+                        border_style="cyan",
+                    )
+                )
+
+            # ---------------------------------------------------------
+            # Email
+            # ---------------------------------------------------------
+
+            elif choice == "7":
+                email = _prompt(
+                    "Email"
+                )
+
+                if not email:
+                    continue
+
+                with console.status(
+                    "[cyan]Analyzing email domain...[/cyan]"
+                ):
+                    result = (
+                        email_intelligence(
+                            email
+                        )
+                    )
+
+                console.print(
+                    Panel(
+                        json.dumps(
+                            result,
+                            indent=2,
+                            default=str,
+                        ),
+                        title="Email Intelligence",
+                        border_style="cyan",
+                    )
+                )
+
+            # ---------------------------------------------------------
+            # Ahmia
+            # ---------------------------------------------------------
 
             elif choice == "8":
+                query = _prompt(
+                    "Ahmia search"
+                )
+
+                if not query:
+                    continue
+
+                with console.status(
+                    "[cyan]Searching Ahmia...[/cyan]"
+                ):
+                    result = (
+                        ahmia_search(
+                            query
+                        )
+                    )
+
+                if result.get("error"):
+                    console.print(
+                        f"[red]{result['error']}[/red]"
+                    )
+                    continue
+
+                console.print(
+                    f"[green]Found "
+                    f"{result['total']} "
+                    f".onion indicators.[/green]"
+                )
+
+                if result["v3_links"]:
+                    console.print(
+                        Panel(
+                            "\n".join(
+                                result[
+                                    "v3_links"
+                                ]
+                            ),
+                            title="Onion v3",
+                            border_style="magenta",
+                        )
+                    )
+
+                if result["v2_links"]:
+                    console.print(
+                        Panel(
+                            "\n".join(
+                                result[
+                                    "v2_links"
+                                ]
+                            ),
+                            title="Onion v2",
+                            border_style="red",
+                        )
+                    )
+
+            # ---------------------------------------------------------
+            # Redirects
+            # ---------------------------------------------------------
+
+            elif choice == "9":
+                target = _prompt(
+                    "HTTP/HTTPS URL"
+                )
+
+                if not target:
+                    continue
+
+                with console.status(
+                    "[cyan]Analyzing redirects...[/cyan]"
+                ):
+                    result = (
+                        analyze_redirects(
+                            target
+                        )
+                    )
+
+                table = Table(
+                    title="Redirect Chain",
+                    border_style="cyan",
+                )
+
+                table.add_column(
+                    "#"
+                )
+
+                table.add_column(
+                    "Status"
+                )
+
+                table.add_column(
+                    "URL"
+                )
+
+                for index, item in enumerate(
+                    result["chain"],
+                    start=1,
+                ):
+                    table.add_row(
+                        str(index),
+                        str(
+                            item[
+                                "status_code"
+                            ]
+                        ),
+                        item["url"][:150],
+                    )
+
+                console.print(
+                    table
+                )
+
+                if result.get(
+                    "final_url"
+                ):
+                    console.print(
+                        f"[green]Final URL:[/green] "
+                        f"{result['final_url']}"
+                    )
+
+                if result.get("error"):
+                    console.print(
+                        f"[red]{result['error']}[/red]"
+                    )
+
+            # ---------------------------------------------------------
+            # Tor
+            # ---------------------------------------------------------
+
+            elif choice == "10":
+                with console.status(
+                    "[magenta]Testing Tor SOCKS connectivity...[/magenta]"
+                ):
+                    result = (
+                        check_tor_connection()
+                    )
+
+                if result.get(
+                    "tor_working"
+                ):
+                    console.print(
+                        Panel(
+                            f"[green]Tor connection operational[/green]\n"
+                            f"SOCKS: "
+                            f"{TOR_SOCKS_HOST}:"
+                            f"{TOR_SOCKS_PORT}\n"
+                            f"Exit IP: "
+                            f"[cyan]"
+                            f"{result.get('exit_ip')}"
+                            f"[/cyan]",
+                            title="Tor",
+                            border_style="green",
+                        )
+                    )
+                else:
+                    console.print(
+                        Panel(
+                            f"[red]Tor unavailable[/red]\n"
+                            f"{result.get('error')}",
+                            title="Tor",
+                            border_style="red",
+                        )
+                    )
+
+            # ---------------------------------------------------------
+            # JSON report
+            # ---------------------------------------------------------
+
+            elif choice == "11":
+                target = _prompt(
+                    "Target"
+                )
+
+                if not target:
+                    continue
+
+                with console.status(
+                    "[cyan]Building report...[/cyan]"
+                ):
+                    report = full_recon(
+                        target
+                    )
+
+                _save_report_interactive(
+                    report
+                )
+
+            # ---------------------------------------------------------
+            # Exit
+            # ---------------------------------------------------------
+
+            elif choice == "12":
+                console.print(
+                    "[dim]Leaving Dark Web Intelligence module.[/dim]"
+                )
                 break
 
         except KeyboardInterrupt:
-            console.print("\n[yellow]Cancelled[/yellow]")
-        except Exception as e:
-            console.print(f"[red]Error: {type(e).__name__}: {e}[/red]")
+            console.print(
+                "\n[yellow]Operation cancelled.[/yellow]"
+            )
+
+        except Exception as exc:
+            console.print(
+                f"[red]Error: "
+                f"{type(exc).__name__}: "
+                f"{exc}[/red]"
+            )
 
 
-# Backwards-compat alias
+# ---------------------------------------------------------------------
+# Backwards compatibility
+# ---------------------------------------------------------------------
+
+
 def darkweb_menu() -> None:
     return run_darkweb_menu()
+
+
+# ---------------------------------------------------------------------
+# Module entry point
+# ---------------------------------------------------------------------
 
 
 if __name__ == "__main__":
