@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 SpectraScann - Optimized Edition
 Features: SYN, UDP, OS Detection, SSL/TLS, HTTP Enum, Firewall Detection,
@@ -21,6 +20,7 @@ import re
 import csv
 import ipaddress
 import html
+import urllib.parse
 from functools import wraps
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
@@ -201,13 +201,64 @@ class ReportManager:
             print(f"{RED}Invalid input.{RESET}")
 
 # ============== Utility Functions ==============
-def resolve_host(hostname: str) -> str:
-    """Resolve hostname to IP"""
+def normalize_target(target: str) -> str:
+    """Normalize an IP, CIDR, hostname, host:port, or HTTP(S) URL."""
+    if not target:
+        return ""
+
+    target = target.strip()
+    target = target.strip("\"'")
+
+    if not target:
+        return ""
+
     try:
-        return socket.gethostbyname(hostname)
-    except socket.gaierror:
-        print(f"{RED}[-] Error: Cannot resolve {hostname}")
-        sys.exit(1)
+        ipaddress.ip_network(target, strict=False)
+        return target
+    except ValueError:
+        pass
+
+    if "://" in target:
+        try:
+            parsed = urllib.parse.urlparse(target)
+            if parsed.hostname:
+                return parsed.hostname
+        except Exception:
+            pass
+
+    try:
+        if target.startswith("["):
+            closing = target.find("]")
+            if closing != -1:
+                return target[1:closing]
+
+        parsed = urllib.parse.urlparse("//" + target)
+        if parsed.hostname:
+            return parsed.hostname
+    except Exception:
+        pass
+
+    return target.rstrip("/")
+
+
+def resolve_host(hostname: str) -> str:
+    """Resolve a single host/IP. CIDR networks are handled separately."""
+    target = normalize_target(hostname)
+
+    if not target:
+        raise ValueError("Target cannot be empty")
+
+    try:
+        network = ipaddress.ip_network(target, strict=False)
+        raise ValueError(f"CIDR network detected: {network}")
+    except ValueError as exc:
+        if "CIDR network detected" in str(exc):
+            raise
+
+    try:
+        return socket.gethostbyname(target)
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve target: {target}") from exc
 
 def reverse_dns(ip: str) -> str:
     """Reverse DNS lookup"""
@@ -1468,96 +1519,550 @@ def run_protocol_modules():
         console.print(f"{RED}[!] Error: {e}{RESET}", style="red")
 
 
-# ============== Domain Scanner ==============
+# ============== Domain Intelligence Scanner ==============
 class DomainScanner:
-    """Integrates SpectraScan Domain Scanner features"""
+    """Passive-first domain intelligence for SpectraScan.
+
+    Keeps the existing DomainScanner.scan(domain, report_manager) API while
+    adding WHOIS, DNS, SPF, DMARC, DKIM selector checks, CAA, DNSSEC evidence,
+    Certificate Transparency, passive subdomain discovery, HTTP/TLS metadata,
+    security headers, technology/CDN hints, robots.txt, sitemap and scoring.
+    """
+
+    VERSION = "2.0.0"
+    HTTP_TIMEOUT = 12
+    DNS_TIMEOUT = 4
+    CT_TIMEOUT = 20
+    USER_AGENT = f"SpectraScan-DomainIntelligence/{VERSION}"
+
+    DNS_TYPES = ("A", "AAAA", "MX", "NS", "TXT", "CNAME", "SOA", "CAA", "SRV")
+    SECURITY_HEADERS = (
+        "strict-transport-security", "content-security-policy",
+        "x-content-type-options", "x-frame-options", "referrer-policy",
+        "permissions-policy", "cross-origin-opener-policy",
+        "cross-origin-resource-policy",
+    )
+    DKIM_SELECTORS = (
+        "default", "selector1", "selector2", "google", "k1", "k2",
+        "mail", "dkim", "s1", "s2", "smtp", "mandrill", "zoho",
+        "sendgrid", "mailjet", "amazonses", "protonmail",
+    )
+    TECH_PATTERNS = {
+        "WordPress": (r"/wp-content/", r"/wp-includes/", r"wp-json"),
+        "Drupal": (r"drupalSettings", r"/sites/default/"),
+        "Joomla": (r"/media/system/", r"joomla"),
+        "Next.js": (r"__NEXT_DATA__", r"/_next/"),
+        "Nuxt": (r"__NUXT__", r"/_nuxt/"),
+        "React": (r"react(?:dom)?",),
+        "Vue.js": (r"vue(?:\.router)?",),
+        "Angular": (r"ng-version", r"angular"),
+        "jQuery": (r"jquery",),
+        "Bootstrap": (r"bootstrap",),
+        "Tailwind CSS": (r"tailwind",),
+        "Google Analytics": (r"google-analytics", r"gtag", r"googletagmanager"),
+        "Google Tag Manager": (r"googletagmanager", r"gtm\.js"),
+        "Cloudflare": (r"cf-ray", r"cloudflare"),
+    }
+    CDN_PATTERNS = {
+        "Cloudflare": ("cf-ray", "cf-cache-status", "cloudflare"),
+        "Akamai": ("akamai", "x-akamai"),
+        "Fastly": ("fastly", "x-served-by"),
+        "Amazon CloudFront": ("cloudfront", "x-amz-cf-id", "x-amz-cf-pop"),
+        "Imperva": ("imperva", "incap_ses", "visid_incap"),
+        "Azure Front Door": ("x-azure-ref", "azure"),
+    }
+
     @staticmethod
-    def _run_whois(target: str) -> str:
-        """Run whois against target. Works on any platform that has whois installed."""
+    def normalize_domain(value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            return ""
+        if "://" not in value:
+            value = "https://" + value
         try:
-            result = subprocess.run(
-                ["whois", target],
-                capture_output=True,
-                text=True,
-                timeout=15,
+            host = __import__("urllib.parse", fromlist=["urlparse"]).urlparse(value).hostname or ""
+        except Exception:
+            host = ""
+        return host.lower().rstrip(".")
+
+    @staticmethod
+    def _unique(values):
+        seen, out = set(), []
+        for value in values or []:
+            if value is None:
+                continue
+            value = str(value).strip().rstrip(".")
+            if value and value.lower() not in seen:
+                seen.add(value.lower())
+                out.append(value)
+        return out
+
+    @staticmethod
+    def _write(report_manager, text):
+        try:
+            report_manager.write(str(text))
+        except Exception:
+            pass
+
+    @classmethod
+    def _http(cls, url, timeout=None):
+        try:
+            import requests
+            return requests.get(
+                url,
+                headers={"User-Agent": cls.USER_AGENT, "Accept": "*/*"},
+                timeout=timeout or cls.HTTP_TIMEOUT,
+                allow_redirects=True,
+                verify=True,
             )
-            return result.stdout if result.returncode == 0 else (result.stderr or "whois failed")
-        except FileNotFoundError:
-            # Try a public WHOIS API as a fallback
-            try:
-                curl = subprocess.run(
-                    ["curl", "-s", f"https://api.hackertarget.com/whois/?q={target}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
+        except Exception:
+            return None
+
+    @classmethod
+    def _whois(cls, domain):
+        result = {"available": False, "source": None, "registrar": None,
+                  "organization": None, "creation_date": None,
+                  "expiration_date": None, "updated_date": None,
+                  "name_servers": [], "status": [], "emails": [], "raw": None}
+        try:
+            import whois
+            data = whois.whois(domain)
+            result["available"] = True
+            result["source"] = "python-whois"
+            result["registrar"] = str(data.registrar) if data.registrar else None
+            result["organization"] = str(getattr(data, "org", None)) if getattr(data, "org", None) else None
+            for key, attr in (("creation_date", "creation_date"), ("expiration_date", "expiration_date"), ("updated_date", "updated_date")):
+                value = getattr(data, attr, None)
+                if value:
+                    result[key] = str(value)
+            result["name_servers"] = cls._unique(getattr(data, "name_servers", None) or [])
+            result["status"] = cls._unique(getattr(data, "status", None) or [])
+            result["emails"] = cls._unique(getattr(data, "emails", None) or [])
+            return result
+        except Exception as exc:
+            result["error"] = str(exc)
+        try:
+            proc = subprocess.run(["whois", domain], capture_output=True, text=True, timeout=20)
+            raw = (proc.stdout or proc.stderr or "").strip()
+            if raw:
+                result["available"] = True
+                result["source"] = "system-whois"
+                result["raw"] = raw
+                patterns = {
+                    "registrar": r"(?im)^Registrar(?: Name)?:\s*(.+)$",
+                    "organization": r"(?im)^(?:Registrant Organization|Organization):\s*(.+)$",
+                    "creation_date": r"(?im)^(?:Creation Date|Created|Registered On):\s*(.+)$",
+                    "expiration_date": r"(?im)^(?:Registry Expiry Date|Expiration Date|Expiry Date):\s*(.+)$",
+                    "updated_date": r"(?im)^(?:Updated Date|Last Updated):\s*(.+)$",
+                }
+                for key, pattern in patterns.items():
+                    match = re.search(pattern, raw)
+                    if match:
+                        result[key] = match.group(1).strip()
+                result["name_servers"] = cls._unique(re.findall(r"(?im)^(?:Name Server|Nameserver|nserver):\s*([^\s]+)", raw))
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
+
+    @classmethod
+    def _dns(cls, domain):
+        result = {"records": {}, "errors": {}, "resolved_ips": []}
+        try:
+            import dns.resolver
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = cls.DNS_TIMEOUT
+            resolver.lifetime = cls.DNS_TIMEOUT + 1
+            for rtype in cls.DNS_TYPES:
+                values = []
+                try:
+                    answers = resolver.resolve(domain, rtype, raise_on_no_answer=False)
+                    for answer in answers:
+                        if rtype == "MX":
+                            values.append(f"{answer.exchange} (pref: {answer.preference})")
+                        elif rtype == "SOA":
+                            values.append(str(answer))
+                        else:
+                            values.append(str(answer).strip('"').rstrip('.'))
+                except Exception as exc:
+                    result["errors"][rtype] = str(exc)
+                result["records"][rtype] = cls._unique(values)
+        except ImportError:
+            result["errors"]["dns"] = "dnspython is not installed"
+        except Exception as exc:
+            result["errors"]["dns"] = str(exc)
+        try:
+            result["resolved_ips"] = cls._unique(
+                result["records"].get("A", []) + result["records"].get("AAAA", [])
+            )
+            if not result["resolved_ips"]:
+                result["resolved_ips"] = cls._unique(
+                    item[4][0] for item in socket.getaddrinfo(domain, None)
                 )
-                if curl.returncode == 0 and curl.stdout:
-                    return curl.stdout
-            except FileNotFoundError:
-                pass
-            return "[-] 'whois' not installed. Install it (Linux: apt/yum, macOS: brew, Windows: use WSL or 'whois' from sysinternals)."
-        except Exception as e:
-            return f"whois error: {e}"
+        except Exception:
+            pass
+        return result
+
+    @classmethod
+    def _spf(cls, dns_data):
+        records = [x for x in dns_data.get("records", {}).get("TXT", []) if x.lower().startswith("v=spf1")]
+        return {"present": bool(records), "records": records, "mechanisms": cls._unique(" ".join(records).split()[1:])}
+
+    @classmethod
+    def _dmarc(cls, domain):
+        result = {"present": False, "record": None, "policy": None}
+        try:
+            import dns.resolver
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = cls.DNS_TIMEOUT
+            resolver.lifetime = cls.DNS_TIMEOUT + 1
+            values = [str(x).strip('"') for x in resolver.resolve(f"_dmarc.{domain}", "TXT")]
+            record = next((x for x in values if x.lower().startswith("v=dmarc1")), None)
+            if record:
+                result["present"] = True
+                result["record"] = record
+                match = re.search(r"(?:^|;)\s*p=([^;]+)", record, re.I)
+                result["policy"] = match.group(1).strip().lower() if match else None
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
+
+    @classmethod
+    def _dkim(cls, domain):
+        result = {"tested": list(cls.DKIM_SELECTORS), "found": []}
+        try:
+            import dns.resolver
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 2
+            resolver.lifetime = 3
+            for selector in cls.DKIM_SELECTORS:
+                try:
+                    values = [str(x).strip('"') for x in resolver.resolve(f"{selector}._domainkey.{domain}", "TXT")]
+                    if values:
+                        result["found"].append({"selector": selector, "records": values})
+                except Exception:
+                    continue
+        except ImportError:
+            result["error"] = "dnspython is not installed"
+        return result
 
     @staticmethod
-    def scan(domain: str, report_manager: ReportManager):
-        report_manager.write(f"\n-----DOMAIN SCAN OF {domain}-----\n\n[*] ADMIN INFO \n-------------------------------------------------------------------------------")
+    def _security_headers(headers):
+        normalized = {str(k).lower(): str(v) for k, v in headers.items()}
+        return {key: normalized.get(key) for key in DomainScanner.SECURITY_HEADERS}
 
-        # Whois
-        report_manager.write("\n[*] WHOIS (ADMIN INFO) ")
-        report_manager.write(DomainScanner._run_whois(domain))
+    @classmethod
+    def _technologies(cls, response):
+        body = (response.text or "")[:1500000]
+        blob = body + "\n" + "\n".join(f"{k}: {v}" for k, v in response.headers.items())
+        found = set()
+        for name, patterns in cls.TECH_PATTERNS.items():
+            if any(re.search(p, blob, re.I) for p in patterns):
+                found.add(name)
+        if response.headers.get("Server"):
+            found.add("Server: " + response.headers["Server"].strip())
+        if response.headers.get("X-Powered-By"):
+            found.add("Powered-By: " + response.headers["X-Powered-By"].strip())
+        return sorted(found)
 
-        report_manager.write("\n[*] DNS LOOKUP\n-------------------------------------------------------------------------------")
+    @classmethod
+    def _cdn(cls, headers):
+        blob = "\n".join(f"{k}: {v}" for k, v in headers.items()).lower()
+        return sorted(name for name, patterns in cls.CDN_PATTERNS.items() if any(p.lower() in blob for p in patterns))
 
-        # DNS Lookup via API (Fallback if curl fails)
-        try:
-            result = subprocess.run(
-                ["curl", "-s", f"https://api.hackertarget.com/dnslookup/?q={domain}"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if result.returncode == 0 and result.stdout:
-                report_manager.write(result.stdout)
+    @staticmethod
+    def _title(body):
+        match = re.search(r"<title[^>]*>(.*?)</title>", body or "", re.I | re.S)
+        return re.sub(r"\s+", " ", html.unescape(match.group(1))).strip()[:300] if match else None
+
+    @classmethod
+    def _web(cls, domain):
+        result = {"preferred_url": None, "http": {}, "https": {}, "redirect_chain": [],
+                  "headers": {}, "security_headers": {}, "server": None,
+                  "content_type": None, "title": None, "technologies": [], "cdn": []}
+        responses = {}
+        for scheme in ("https", "http"):
+            response = cls._http(f"{scheme}://{domain}/")
+            if response is not None:
+                responses[scheme] = response
+                result[scheme] = {
+                    "available": True, "status": response.status_code,
+                    "final_url": response.url,
+                    "history": [{"status": x.status_code, "url": x.url, "location": x.headers.get("Location")} for x in response.history],
+                    "headers": dict(response.headers),
+                }
             else:
-                report_manager.write("[*] Falling back to nslookup (built-in tool)\n")
-                ns = subprocess.run(
-                    ["nslookup", domain],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                report_manager.write(ns.stdout)
-        except FileNotFoundError:
-            report_manager.write("[-] 'curl' not found. Using nslookup fallback.\n")
-            try:
-                ns = subprocess.run(
-                    ["nslookup", domain],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                report_manager.write(ns.stdout)
-            except Exception as e:
-                report_manager.write(f"Error with nslookup: {e}")
-        except Exception as e:
-            report_manager.write(f"Error with DNS lookup API: {e}")
+                result[scheme] = {"available": False}
+        response = responses.get("https") or responses.get("http")
+        if response is not None:
+            result["preferred_url"] = response.url
+            result["redirect_chain"] = [x.url for x in response.history] + [response.url]
+            result["headers"] = dict(response.headers)
+            result["security_headers"] = cls._security_headers(response.headers)
+            result["server"] = response.headers.get("Server")
+            result["content_type"] = response.headers.get("Content-Type")
+            result["title"] = cls._title(response.text)
+            result["technologies"] = cls._technologies(response)
+            result["cdn"] = cls._cdn(response.headers)
+        return result
 
-        report_manager.write("\n[*] NSLOOKUP\n-------------------------------------------------------------------------------")
+    @classmethod
+    def _tls(cls, domain):
+        result = {"available": False, "version": None, "cipher": None, "subject": {}, "issuer": {}, "san": [], "not_before": None, "not_after": None}
         try:
-            result = subprocess.run(
-                ["nslookup", domain],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            report_manager.write(result.stdout)
-        except FileNotFoundError:
-            report_manager.write("[-] 'nslookup' not available on this platform.")
-        except Exception as e:
-            report_manager.write(f"Error running nslookup: {e}")
+            context = ssl.create_default_context()
+            with socket.create_connection((domain, 443), timeout=8) as sock:
+                with context.wrap_socket(sock, server_hostname=domain) as tls:
+                    cert = tls.getpeercert()
+                    result["available"] = True
+                    result["version"] = tls.version()
+                    result["cipher"] = tls.cipher()
+                    result["subject"] = dict(x[0] for x in cert.get("subject", ()))
+                    result["issuer"] = dict(x[0] for x in cert.get("issuer", ()))
+                    result["not_before"] = cert.get("notBefore")
+                    result["not_after"] = cert.get("notAfter")
+                    result["san"] = cls._unique(v for k, v in cert.get("subjectAltName", ()) if k.lower() == "dns")
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
 
-        report_manager.write("-------------------------------------------------------------------------------\n[*] DONE")
+    @classmethod
+    def _ct(cls, domain):
+        result = {"available": False, "source": "crt.sh", "certificates": 0, "names": []}
+        try:
+            import requests
+            response = requests.get(
+                "https://crt.sh/", params={"q": f"%.{domain}", "output": "json"},
+                headers={"User-Agent": cls.USER_AGENT}, timeout=cls.CT_TIMEOUT, verify=True,
+            )
+            if response.status_code != 200:
+                result["error"] = f"HTTP {response.status_code}"
+                return result
+            records = response.json()
+            names = set()
+            for record in records:
+                for name in str(record.get("name_value", "")).splitlines():
+                    name = name.strip().lower().replace("*.", "")
+                    if name == domain or name.endswith("." + domain):
+                        names.add(name)
+            result.update({"available": True, "certificates": len(records), "names": sorted(names)})
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
+
+    @classmethod
+    def _subdomains(cls, domain, ct):
+        candidates = set(x for x in ct.get("names", []) if x != domain and x.endswith("." + domain))
+        for prefix in COMMON_SUBDOMAINS:
+            candidates.add(f"{prefix}.{domain}")
+        resolved = []
+        for host in sorted(candidates):
+            try:
+                ips = cls._unique(item[4][0] for item in socket.getaddrinfo(host, None))
+                if ips:
+                    resolved.append({"hostname": host, "ips": ips})
+            except Exception:
+                pass
+        return {"candidates": sorted(candidates), "resolved": resolved, "count": len(resolved)}
+
+    @classmethod
+    def _robots(cls, domain):
+        result = {"found": False, "status": None, "url": None, "sitemaps": [], "disallow": [], "allow": []}
+        for scheme in ("https", "http"):
+            response = cls._http(f"{scheme}://{domain}/robots.txt")
+            if response is not None and response.status_code == 200:
+                result.update({"found": True, "status": response.status_code, "url": response.url})
+                for line in response.text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    value = value.strip()
+                    if key.lower() == "sitemap": result["sitemaps"].append(value)
+                    elif key.lower() == "disallow" and value: result["disallow"].append(value)
+                    elif key.lower() == "allow" and value: result["allow"].append(value)
+                result["sitemaps"] = cls._unique(result["sitemaps"])
+                result["disallow"] = cls._unique(result["disallow"])
+                result["allow"] = cls._unique(result["allow"])
+                return result
+        return result
+
+    @classmethod
+    def _sitemap(cls, domain, robots):
+        candidates = cls._unique(robots.get("sitemaps", []) + [f"https://{domain}/sitemap.xml", f"https://{domain}/sitemap_index.xml"])
+        for url in candidates:
+            response = cls._http(url)
+            if response is None or response.status_code != 200:
+                continue
+            body = response.text
+            if "<urlset" not in body.lower() and "<sitemapindex" not in body.lower() and "xml" not in response.headers.get("Content-Type", "").lower():
+                continue
+            urls = cls._unique(html.unescape(x.strip()) for x in re.findall(r"<loc>\s*(.*?)\s*</loc>", body, re.I | re.S))
+            return {"found": True, "url": response.url, "status": response.status_code, "urls": urls[:5000]}
+        return {"found": False, "url": None, "status": None, "urls": []}
+
+    @classmethod
+    def _reverse_dns(cls, ips):
+        result = {}
+        for ip in ips:
+            try:
+                result[ip] = socket.gethostbyaddr(ip)[0]
+            except Exception:
+                result[ip] = None
+        return result
+
+    @classmethod
+    def _infrastructure(cls, dns_data):
+        ips = dns_data.get("resolved_ips", [])
+        result = {"ips": ips, "reverse_dns": cls._reverse_dns(ips)}
+        api_key = os.environ.get("SHODAN_API_KEY")
+        if api_key and ips:
+            try:
+                import requests
+                response = requests.get(
+                    f"https://api.shodan.io/shodan/host/{ips[0]}",
+                    params={"key": api_key}, headers={"User-Agent": cls.USER_AGENT}, timeout=10,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    result["shodan"] = {
+                        "ip": data.get("ip_str"), "organization": data.get("org"),
+                        "isp": data.get("isp"), "asn": data.get("asn"),
+                        "os": data.get("os"), "ports": data.get("ports", []),
+                    }
+            except Exception as exc:
+                result["shodan_error"] = str(exc)
+        return result
+
+    @classmethod
+    def _score(cls, dns_data, spf, dmarc, dkim, web, tls):
+        score = 0
+        if dns_data.get("records", {}).get("A") or dns_data.get("records", {}).get("AAAA"): score += 10
+        if dns_data.get("records", {}).get("NS"): score += 5
+        if dns_data.get("records", {}).get("SOA"): score += 5
+        if dns_data.get("records", {}).get("CAA"): score += 5
+        if spf.get("present"): score += 8
+        if dmarc.get("present"): score += 8
+        if dmarc.get("policy") in ("quarantine", "reject"): score += 4
+        if dkim.get("found"): score += 5
+        if tls.get("available"): score += 15
+        if tls.get("version") in ("TLSv1.2", "TLSv1.3"): score += 5
+        if web.get("https", {}).get("available"): score += 8
+        headers = web.get("security_headers", {})
+        score += min(17, sum(2 for value in headers.values() if value))
+        score = min(100, score)
+        rating = "EXCELLENT" if score >= 90 else "STRONG" if score >= 75 else "MODERATE" if score >= 60 else "WEAK" if score >= 40 else "HIGH EXPOSURE"
+        return {"score": score, "rating": rating}
+
+    @classmethod
+    def _findings(cls, spf, dmarc, caa, dnssec, web, tls, robots, ct):
+        findings = []
+        if not spf.get("present"): findings.append({"severity": "MEDIUM", "category": "Email", "message": "No SPF record observed."})
+        if not dmarc.get("present"): findings.append({"severity": "MEDIUM", "category": "Email", "message": "No DMARC record observed."})
+        elif dmarc.get("policy") == "none": findings.append({"severity": "LOW", "category": "Email", "message": "DMARC policy is set to none."})
+        if not caa.get("records"): findings.append({"severity": "LOW", "category": "DNS", "message": "No CAA record observed."})
+        if not dnssec.get("present"): findings.append({"severity": "LOW", "category": "DNS", "message": "DNSSEC evidence was not observed."})
+        missing = [k for k, v in web.get("security_headers", {}).items() if not v]
+        if missing: findings.append({"severity": "LOW", "category": "Web", "message": f"{len(missing)} recommended security headers were not observed.", "details": missing})
+        if web.get("https", {}).get("available") and not web.get("security_headers", {}).get("strict-transport-security"):
+            findings.append({"severity": "LOW", "category": "TLS", "message": "HTTPS is available but HSTS was not observed."})
+        if not tls.get("available"): findings.append({"severity": "MEDIUM", "category": "TLS", "message": "TLS certificate inspection failed."})
+        if robots.get("disallow"): findings.append({"severity": "INFO", "category": "Web", "message": "robots.txt exposes disallowed paths.", "details": robots["disallow"][:50]})
+        if ct.get("names"): findings.append({"severity": "INFO", "category": "CT", "message": f"{len(ct['names'])} certificate names discovered."})
+        return findings
+
+    @classmethod
+    def scan(cls, domain: str, report_manager: ReportManager):
+        started = time.time()
+        domain = cls.normalize_domain(domain)
+        if not domain or len(domain) > 253 or " " in domain:
+            cls._write(report_manager, "[-] Invalid domain.")
+            return None
+
+        cls._write(report_manager, f"\n-----DOMAIN INTELLIGENCE SCAN: {domain}-----\n")
+        data = {"module": "Domain Intelligence", "version": cls.VERSION, "domain": domain,
+                "timestamp": datetime.now().isoformat(), "whois": {}, "dns": {}, "spf": {},
+                "dmarc": {}, "dkim": {}, "caa": {}, "dnssec": {}, "certificate_transparency": {},
+                "subdomains": {}, "infrastructure": {}, "web": {}, "tls": {}, "robots": {},
+                "sitemap": {}, "findings": [], "score": {}}
+
+        steps = [
+            ("WHOIS", lambda: cls._whois(domain), "whois"),
+            ("DNS", lambda: cls._dns(domain), "dns"),
+        ]
+        for label, func, key in steps:
+            cls._write(report_manager, f"[*] Collecting {label}...")
+            try: data[key] = func()
+            except Exception as exc: data[key] = {"error": str(exc)}
+
+        try: data["spf"] = cls._spf(data["dns"])
+        except Exception as exc: data["spf"] = {"error": str(exc), "present": False}
+        try: data["dmarc"] = cls._dmarc(domain)
+        except Exception as exc: data["dmarc"] = {"error": str(exc), "present": False}
+        try: data["dkim"] = cls._dkim(domain)
+        except Exception as exc: data["dkim"] = {"error": str(exc), "found": []}
+
+        records = data["dns"].get("records", {})
+        data["caa"] = {"present": bool(records.get("CAA")), "records": records.get("CAA", [])}
+        data["dnssec"] = {"present": bool(records.get("DS") or records.get("DNSKEY")), "records": {"DS": records.get("DS", []), "DNSKEY": records.get("DNSKEY", [])}}
+
+        cls._write(report_manager, "[*] Querying Certificate Transparency...")
+        data["certificate_transparency"] = cls._ct(domain)
+        data["subdomains"] = cls._subdomains(domain, data["certificate_transparency"])
+        cls._write(report_manager, "[*] Inspecting HTTP/HTTPS and TLS...")
+        data["web"] = cls._web(domain)
+        data["tls"] = cls._tls(domain)
+        data["robots"] = cls._robots(domain)
+        data["sitemap"] = cls._sitemap(domain, data["robots"])
+        data["infrastructure"] = cls._infrastructure(data["dns"])
+        data["related_hosts"] = cls._unique(
+            records.get("NS", []) + records.get("CNAME", []) + records.get("MX", [])
+        )
+        data["findings"] = cls._findings(data["spf"], data["dmarc"], data["caa"], data["dnssec"], data["web"], data["tls"], data["robots"], data["certificate_transparency"])
+        data["score"] = cls._score(data["dns"], data["spf"], data["dmarc"], data["dkim"], data["web"], data["tls"])
+        data["runtime_seconds"] = round(time.time() - started, 2)
+
+        cls._write(report_manager, "\n[ WHOIS ]")
+        whois_data = data["whois"]
+        for key in ("registrar", "organization", "creation_date", "updated_date", "expiration_date"):
+            cls._write(report_manager, f"{key.replace('_', ' ').title()}: {whois_data.get(key) or 'Unknown'}")
+        cls._write(report_manager, "Name Servers: " + (", ".join(whois_data.get("name_servers", [])) or "Unknown"))
+
+        cls._write(report_manager, "\n[ DNS ]")
+        for rtype in cls.DNS_TYPES:
+            values = records.get(rtype, [])
+            if values: cls._write(report_manager, f"{rtype}: {', '.join(values[:25])}")
+
+        cls._write(report_manager, "\n[ EMAIL SECURITY ]")
+        cls._write(report_manager, f"SPF: {'FOUND' if data['spf'].get('present') else 'NOT FOUND'}")
+        cls._write(report_manager, f"DMARC: {data['dmarc'].get('policy') or 'NOT FOUND'}")
+        cls._write(report_manager, f"DKIM selectors found: {len(data['dkim'].get('found', []))}")
+
+        cls._write(report_manager, "\n[ WEB / TLS ]")
+        cls._write(report_manager, f"URL: {data['web'].get('preferred_url') or 'Unavailable'}")
+        cls._write(report_manager, f"Title: {data['web'].get('title') or 'Unknown'}")
+        cls._write(report_manager, f"Server: {data['web'].get('server') or 'Unknown'}")
+        cls._write(report_manager, "Technologies: " + (", ".join(data['web'].get('technologies', [])) or "None detected"))
+        cls._write(report_manager, "CDN/WAF: " + (", ".join(data['web'].get('cdn', [])) or "None detected"))
+        cls._write(report_manager, f"TLS: {data['tls'].get('version') or 'Unavailable'}")
+        cls._write(report_manager, f"TLS SANs: {len(data['tls'].get('san', []))}")
+
+        cls._write(report_manager, "\n[ CERTIFICATE TRANSPARENCY / SUBDOMAINS ]")
+        cls._write(report_manager, f"Certificates: {data['certificate_transparency'].get('certificates', 0)}")
+        cls._write(report_manager, f"Resolved subdomains: {data['subdomains'].get('count', 0)}")
+        for item in data["subdomains"].get("resolved", [])[:100]:
+            cls._write(report_manager, f"  {item['hostname']} -> {', '.join(item['ips'])}")
+
+        cls._write(report_manager, "\n[ PUBLIC RESOURCES ]")
+        cls._write(report_manager, f"robots.txt: {'FOUND' if data['robots'].get('found') else 'NOT FOUND'}")
+        cls._write(report_manager, f"sitemap: {'FOUND' if data['sitemap'].get('found') else 'NOT FOUND'}")
+
+        cls._write(report_manager, "\n[ FINDINGS ]")
+        for finding in data["findings"] or [{"severity": "INFO", "category": "General", "message": "No notable findings."}]:
+            cls._write(report_manager, f"[{finding['severity']}] {finding['category']}: {finding['message']}")
+
+        cls._write(report_manager, f"\n[ INTELLIGENCE SCORE ] {data['score']['score']}/100 — {data['score']['rating']}")
+        cls._write(report_manager, f"[*] DOMAIN INTELLIGENCE COMPLETE in {data['runtime_seconds']:.2f}s")
+        return data
 
 # ============== IP Scanner ==============
 class IPScanner:
@@ -1820,41 +2325,212 @@ def parse_ports(ports_input: str):
     return sorted(ports) if ports else None
  
  
+def run_network_port_scan(
+    network_target: str,
+    scan_kwargs: dict,
+):
+    """Scan each usable host in a CIDR network."""
+
+    try:
+        network = ipaddress.ip_network(
+            network_target,
+            strict=False,
+        )
+    except ValueError as exc:
+        console.print(
+            f"[!] Invalid network: {exc}",
+            style="bold red",
+        )
+        return []
+
+    hosts = list(network.hosts())
+
+    if not hosts:
+        console.print(
+            "[!] No usable hosts found.",
+            style="bold red",
+        )
+        return []
+
+    if len(hosts) > 256:
+        proceed = Confirm.ask(
+            f"[!] Network contains {len(hosts)} hosts. Continue?",
+            default=False,
+        )
+        if not proceed:
+            console.print(
+                "[*] Network scan cancelled.",
+                style="yellow",
+            )
+            return []
+
+    console.print(
+        "\n[bold cyan]"
+        "============================================================"
+        "[/bold cyan]"
+    )
+    console.print(
+        f"[bold green][+] Network Scan: {network}[/bold green]"
+    )
+    console.print(
+        f"[cyan][*] Hosts: {len(hosts)}[/cyan]"
+    )
+    console.print(
+        "[bold cyan]"
+        "============================================================"
+        "[/bold cyan]\n"
+    )
+
+    all_results = []
+
+    for index, host in enumerate(hosts, start=1):
+        host_ip = str(host)
+
+        console.print(
+            f"\n[bold yellow]"
+            f"[{index}/{len(hosts)}] Scanning {host_ip}"
+            f"[/bold yellow]"
+        )
+
+        try:
+            resolved_ip = resolve_host(host_ip)
+
+            scanner = PortScanner(
+                host_ip,
+                **scan_kwargs,
+            )
+
+            scanner.resolved_ip = resolved_ip
+            scanner.scan()
+
+            result = scanner.get_results()
+
+            if isinstance(result, dict):
+                all_results.append(result)
+
+            scanner.print_summary()
+
+        except KeyboardInterrupt:
+            console.print(
+                "\n[!] Network scan interrupted.",
+                style="yellow",
+            )
+            break
+
+        except Exception as exc:
+            console.print(
+                f"[!] {host_ip}: {exc}",
+                style="red",
+            )
+
+    total_open = sum(
+        len(result.get("open_ports", []))
+        for result in all_results
+        if isinstance(result, dict)
+    )
+
+    console.print(
+        "\n[bold cyan]"
+        "============================================================"
+        "[/bold cyan]"
+    )
+    console.print(
+        "[bold green][✓] Network scan complete[/bold green]"
+    )
+    console.print(
+        f"[cyan][*] Hosts processed: "
+        f"{len(all_results)}/{len(hosts)}[/cyan]"
+    )
+    console.print(
+        f"[cyan][*] Total open ports: {total_open}[/cyan]"
+    )
+    console.print(
+        "[bold cyan]"
+        "============================================================"
+        "[/bold cyan]"
+    )
+
+    return all_results
+
+
 @guard_interrupt
 def run_port_scan_cli():
-    """Interactive Port Scan Menu"""
-    console.print("\n[bold cyan]--- PORT SCANNER MODULE ---[/bold cyan]")
- 
-    target = hacker_input("Enter Target IP or Hostname")
-    if not target:
-        console.print("[!] Target required. Returning to menu.", style="red")
-        return
- 
-    scan_type = Prompt.ask("Scan Type", choices=["tcp", "syn", "udp"], default="tcp")
-    timing = Prompt.ask("Timing Profile", choices=["T0", "T1", "T2", "T3", "T4", "T5"], default="T3")
- 
-    ports_input = hacker_input(
-        "Enter Ports (e.g. 80,443,8080 or 1-1024), 'common', or 'all'", "common"
+    """Interactive Port Scan Menu."""
+
+    console.print(
+        "\n[bold cyan]--- PORT SCANNER MODULE ---[/bold cyan]"
     )
-    ports = parse_ports(ports_input)
-    if ports is None:
-        console.print("[!] Invalid port format. Returning to menu.", style="red")
+
+    target = hacker_input(
+        "Enter Target IP, CIDR, Hostname, or URL"
+    )
+
+    if not target:
+        console.print(
+            "[!] Target required. Returning to menu.",
+            style="red",
+        )
         return
- 
+
+    target = normalize_target(target)
+
+    if not target:
+        console.print(
+            "[!] Invalid target.",
+            style="red",
+        )
+        return
+
+    scan_type = Prompt.ask(
+        "Scan Type",
+        choices=["tcp", "syn", "udp"],
+        default="tcp",
+    )
+
+    timing = Prompt.ask(
+        "Timing Profile",
+        choices=["T0", "T1", "T2", "T3", "T4", "T5"],
+        default="T3",
+    )
+
+    ports_input = hacker_input(
+        "Enter Ports (e.g. 80,443,8080 or 1-1024), "
+        "'common', or 'all'",
+        "common",
+    )
+
+    ports = parse_ports(ports_input)
+
+    if ports is None:
+        console.print(
+            "[!] Invalid port format. Returning to menu.",
+            style="red",
+        )
+        return
+
     if len(ports) > 5000:
         proceed = Confirm.ask(
             f"[!] {len(ports)} ports selected — this may take a while. Continue?",
             default=True,
         )
         if not proceed:
-            console.print("[*] Scan cancelled.", style="yellow")
+            console.print(
+                "[*] Scan cancelled.",
+                style="yellow",
+            )
             return
- 
-    check_vulns = Confirm.ask("Check for Vulnerabilities?", default=False)
- 
-    console.print(f"\n[+] Spectra Starting Scan on {target}...", style="bold yellow")
- 
-    kwargs = {
+
+    check_vulns = Confirm.ask(
+        "Check for Vulnerabilities?",
+        default=False,
+    )
+
+    console.print(
+        f"\n[+] Spectra Starting Scan on {target}...",
+        style="bold yellow",
+    )
+
+    scan_kwargs = {
         "timeout": 1.0,
         "threads": 50,
         "scan_type": scan_type,
@@ -1864,43 +2540,116 @@ def run_port_scan_cli():
         "check_vulns": check_vulns,
         "rate_limit": 0,
     }
- 
+
     try:
-        scanner = PortScanner(target, **kwargs)
-        scanner.initialize()
+        network = ipaddress.ip_network(
+            target,
+            strict=False,
+        )
+
+        console.print(
+            f"[cyan][*] CIDR network detected: {network}[/cyan]"
+        )
+
+        run_network_port_scan(
+            str(network),
+            scan_kwargs,
+        )
+        return
+
+    except ValueError:
+        pass
+
+    try:
+        resolved_ip = resolve_host(target)
+
+        console.print(
+            f"[cyan][*] Resolved: "
+            f"{target} -> {resolved_ip}[/cyan]"
+        )
+    except Exception as exc:
+        console.print(
+            f"[!] Cannot resolve target: {exc}",
+            style="bold red",
+        )
+        return
+
+    try:
+        scanner = PortScanner(
+            target,
+            **scan_kwargs,
+        )
+
+        scanner.resolved_ip = resolved_ip
         scanner.scan()
+
     except KeyboardInterrupt:
-        console.print("\n[!] Scan interrupted by user.", style="yellow")
+        console.print(
+            "[!] Scan interrupted by user.",
+            style="yellow",
+        )
         return
-    except Exception as e:
-        console.print(f"[!] Scan failed: {e}", style="bold red")
+
+    except Exception as exc:
+        console.print(
+            f"[!] Scan failed: {exc}",
+            style="bold red",
+        )
         return
- 
+
     scanner.print_summary()
- 
-    if scanner.results:
-        export = Confirm.ask("Export Results?", default=True)
-        if export:
-            fmt = Prompt.ask("Format", choices=["json", "html", "csv"], default="json")
-            filename = hacker_input("Filename (without extension)", "scan_report")
-            # Basic sanitization to avoid accidental path traversal / weird chars
-            filename = "".join(c for c in filename if c.isalnum() or c in ("_", "-")) or "scan_report"
-            full_path = f"{filename}.{fmt}"
- 
-            try:
-                if fmt == "json":
-                    scanner.export_json(full_path)
-                elif fmt == "html":
-                    scanner.export_html(full_path)
-                elif fmt == "csv":
-                    scanner.export_csv(full_path)
-                console.print(f"[+] Results exported to {full_path}", style="green")
-            except Exception as e:
-                console.print(f"[!] Export failed: {e}", style="bold red")
-    else:
-        console.print("[*] No results to export.", style="yellow")
- 
- 
+
+    if not scanner.results:
+        console.print(
+            "[*] No results to export.",
+            style="yellow",
+        )
+        return
+
+    if not Confirm.ask(
+        "Export Results?",
+        default=True,
+    ):
+        return
+
+    fmt = Prompt.ask(
+        "Format",
+        choices=["json", "html", "csv"],
+        default="json",
+    )
+
+    filename = hacker_input(
+        "Filename (without extension)",
+        "scan_report",
+    )
+
+    filename = "".join(
+        char
+        for char in filename
+        if char.isalnum() or char in ("_", "-")
+    ) or "scan_report"
+
+    full_path = f"{filename}.{fmt}"
+
+    try:
+        if fmt == "json":
+            scanner.export_json(full_path)
+        elif fmt == "html":
+            scanner.export_html(full_path)
+        else:
+            scanner.export_csv(full_path)
+
+        console.print(
+            f"[+] Results exported to {full_path}",
+            style="green",
+        )
+
+    except Exception as exc:
+        console.print(
+            f"[!] Export failed: {exc}",
+            style="bold red",
+        )
+
 @guard_interrupt
 def run_other_scanners():
     """Interactive menu for Domain, IP, Email, etc."""
@@ -1984,13 +2733,21 @@ def main():
  
         if args.target:
             try:
-                scanner = PortScanner(args.target)
-                scanner.initialize()
+                target = normalize_target(args.target)
+                resolved_ip = resolve_host(target)
+
+                scanner = PortScanner(target)
+                scanner.resolved_ip = resolved_ip
                 scanner.scan()
                 scanner.print_summary()
-            except Exception as e:
-                console.print(f"[!] Scan failed: {e}", style="bold red")
+
+            except Exception as exc:
+                console.print(
+                    f"[!] Scan failed: {exc}",
+                    style="bold red",
+                )
                 sys.exit(1)
+
             return
  
     print_banner()

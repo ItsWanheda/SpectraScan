@@ -1,4 +1,7 @@
-# SpectraScan dependencies
+# ============================================================
+# SpectraScan — Core Dependencies
+# ============================================================
+
 dnspython
 colorama
 prettytable
@@ -11,7 +14,23 @@ pyyaml
 rich>=13.0
 impacket>=0.10.0
 
+
+# ============================================================
+# Domain Intelligence / OSINT
+# ============================================================
+
+# WHOIS registration intelligence
+python-whois
+
+
+# ============================================================
 # Dark Web Recon Module (modules/darkweb.py)
-# Needed for .onion resolve + hidden service banner via Tor SOCKS5.
-# Clearnet features (Ahmia/PGP/BTC/emailrep) still work without it.
+# ============================================================
+
+# Tor SOCKS5 support for .onion resolution
+# and hidden-service banner collection.
+#
+# Clearnet functionality such as Ahmia,
+# PGP, BTC and email reputation does not
+# require Tor.
 pysocks
