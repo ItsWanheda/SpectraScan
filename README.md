@@ -671,10 +671,11 @@ SpectraScan/
 - [ ] Subdomain permutation engine (altDNS-style)
 - [ ] Email-to-username → password-spray correlation
 - [ ] WebSocket / GraphQL introspection modules
-- [ ] HTML report theme selection (dark / light / terminal)
-- [ ] Plugin loader (drop-in `~/.spectrascan/plugins/`)
+- [ ] Multi-user collaboration & scan sharing
+- [ ] Machine learning-based anomaly detection
 - [ ] Docker image (`docker run -it spectrascan`)
-- [ ] Web UI (FastAPI + HTMX, optional)
+- [ ] GitHub Actions CI/CD integration
+- [ ] Plugin marketplace for custom modules
 
 ---
 
@@ -792,4 +793,3 @@ SOFTWARE.
 Made with ❤️ by the ItsWanheda & An0nym0us
 
 </div>
-
