@@ -726,9 +726,22 @@ replace every specialized tool.
 
 ---
 
+
+
+### Async Scanner Engine
+
+SpectraScan now includes an additive `AsyncPortScanner` engine in `modules/async_scanner.py`. It uses `asyncio` for concurrent TCP probing and `aiohttp` for optional HTTP enrichment without replacing the legacy `PortScanner` API.
+
+CLI usage:
+
+```bash
+python SpectraScan.py -t scanme.nmap.org --async-scan
+python SpectraScan.py -t scanme.nmap.org --async-scan --async-concurrency 200 --async-timeout 0.75
+```
+
 ## 🛣️ Roadmap
 
-- [ ] Async scanner engine with `asyncio` + `aiohttp`
+- [x] Async scanner engine with `asyncio` + `aiohttp`
 - [ ] Kerberos enumeration + AS-REP roasting detection
 - [ ] Subdomain permutation engine
 - [ ] Email-to-username correlation workflows
