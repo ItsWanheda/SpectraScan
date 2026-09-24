@@ -1,63 +1,81 @@
-import requests
-import threading
-import queue
 import logging
+import queue
+import threading
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import requests
+
+
+logger = logging.getLogger(__name__)
+
 
 class WebEnumerator:
     def __init__(self, base_url, wordlist_path, max_threads=20):
-        self.base_url = base_url.rstrip('/')
+        self.base_url = base_url.rstrip("/")
         self.wordlist_path = wordlist_path
-        self.max_threads = max_threads
+        self.max_threads = max(1, int(max_threads))
         self.found_paths = []
         self.lock = threading.Lock()
 
     def load_wordlist(self):
         try:
-            with open(self.wordlist_path, 'r') as f:
-                return [line.strip() for line in f if line.strip()]
-        except FileNotFoundError:
-            logging.error(f"Wordlist not found: {self.wordlist_path}")
+            with open(self.wordlist_path, "r", encoding="utf-8", errors="ignore") as file:
+                return [line.strip() for line in file if line.strip()]
+        except OSError as exc:
+            logger.error("Unable to read wordlist %s: %s", self.wordlist_path, exc)
             return []
 
     def check_path(self, path):
-        url = f"{self.base_url}/{path}"
+        url = f"{self.base_url}/{path.lstrip('/')}"
         try:
-            resp = requests.head(url, timeout=2, allow_redirects=False)
-            if resp.status_code in [200, 301, 302, 403]:
+            response = requests.head(
+                url,
+                timeout=2,
+                allow_redirects=False,
+            )
+            if response.status_code in {200, 301, 302, 403}:
+                result = {
+                    "path": path,
+                    "status": response.status_code,
+                    "url": url,
+                }
                 with self.lock:
-                    self.found_paths.append({
-                        'path': path,
-                        'status': resp.status_code,
-                        'url': url
-                    })
-                    logging.info(f"[+] Found: {url} ({resp.status_code})")
-        except requests.exceptions.RequestException:
+                    self.found_paths.append(result)
+                logger.info("[+] Found: %s (%s)", url, response.status_code)
+        except requests.RequestException:
             pass
 
     def run(self):
         wordlist = self.load_wordlist()
         if not wordlist:
-            return
+            return []
 
         tasks = queue.Queue()
-        threads = []
-
-        def worker():
-            while not tasks.empty():
-                path = tasks.get()
-                self.check_path(path)
-                tasks.task_done()
-
-        for _ in range(self.max_threads):
-            t = threading.Thread(target=worker)
-            t.daemon = True
-            t.start()
-            threads.append(t)
-
         for word in wordlist:
             tasks.put(word)
 
+        def worker():
+            while True:
+                try:
+                    path = tasks.get_nowait()
+                except queue.Empty:
+                    return
+
+                try:
+                    self.check_path(path)
+                finally:
+                    tasks.task_done()
+
+        threads = [
+            threading.Thread(target=worker, daemon=True)
+            for _ in range(min(self.max_threads, tasks.qsize()))
+        ]
+
+        for thread in threads:
+            thread.start()
+
         tasks.join()
-        return self.found_paths
+
+        for thread in threads:
+            thread.join(timeout=1)
+
+        return list(self.found_paths)

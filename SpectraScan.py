@@ -36,6 +36,8 @@ from rich.markdown import Markdown
 from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from modules.async_scanner import AsyncPortScanner
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "modules"))
 
 # Initialize Rich Console
@@ -6875,18 +6877,29 @@ def main():
         parser.add_argument("-t", "--target", help="Target")
         parser.add_argument("-d", "--domain", help="Domain")
         parser.add_argument("-i", "--ip", help="IP")
+        parser.add_argument("--async-scan", action="store_true", help="Use the asyncio/aiohttp scanner engine for TCP scans")
+        parser.add_argument("--async-concurrency", type=int, default=100, help="Maximum concurrent async connections (default: 100)")
+        parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout in seconds (default: 1.0)")
         args, _ = parser.parse_known_args()
- 
+
         if args.target:
             try:
                 target = normalize_target(args.target)
                 resolved_ip = resolve_host(target)
 
-                scanner = PortScanner(target)
-                scanner.resolved_ip = resolved_ip
-                scanner.scan()
-                scanner.print_summary()
-
+                if args.async_scan:
+                    scanner = AsyncPortScanner(target, ports=list(COMMON_PORTS.keys()), timeout=args.async_timeout, concurrency=args.async_concurrency)
+                    scanner.resolved_ip = resolved_ip
+                    asyncio.run(scanner.scan_async())
+                    result = scanner.get_results()
+                    console.print(f"[green][✓] Async scan completed in {result['duration']:.2f}s — {len(result['open_ports'])} open ports[/green]")
+                    for item in sorted(result["open_ports"], key=lambda value: value["port"]):
+                        console.print(f"[green][+] {item['port']}/tcp {item.get('service', 'unknown')} {item.get('banner', '')[:80]}[/green]")
+                else:
+                    scanner = PortScanner(target)
+                    scanner.resolved_ip = resolved_ip
+                    scanner.scan()
+                    scanner.print_summary()
             except Exception as exc:
                 console.print(
                     f"[!] Scan failed: {exc}",

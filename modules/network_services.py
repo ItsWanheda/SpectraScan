@@ -54,17 +54,17 @@ def deep_scan(ip: str, ports: List[int] = None, max_workers: int = 5) -> Dict:
         ports = list(SERVICE_MAP.keys())
     results = {"target": ip, "scans": {}, "vulnerabilities": []}
 
-    scan_targets = [(ip, p) for p in ports if SERVICE_MAP.get(p, (None, None)) is not None]
-    # Special handling for SNMP (UDP)
+    scan_targets = [(ip, p) for p in ports if SERVICE_MAP.get(p, (None, None))[1] is not None and p != 161]
+    # SNMP is UDP and requires its dedicated enumerator.
     snmp_targets = [(ip, p) for p in ports if p == 161]
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
         for ip_t, port in scan_targets:
-            service_name = SERVICE_MAP[port]
+            service_name, _ = SERVICE_MAP[port]
             futures[executor.submit(scan_port_with_service, ip_t, port)] = service_name
 
-        for ip_t, port in snmp_targets:
+        for ip_t, _ in snmp_targets:
             futures[executor.submit(snmp_enum.SNMPEnumerator.scan, ip_t)] = "snmp"
 
         for future in as_completed(futures):
