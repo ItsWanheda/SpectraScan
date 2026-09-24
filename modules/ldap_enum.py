@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 
 
 class LDAPEnumerator:
-    DEFAULT_PORTS =
+    DEFAULT_PORTS = [389, 636]
 
     @staticmethod
     def _ber_encode_length(length: int) -> bytes:

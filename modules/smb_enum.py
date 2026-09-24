@@ -14,7 +14,7 @@ from typing import Dict, List
 
 
 class SMBEnumerator:
-    DEFAULT_PORTS =
+    DEFAULT_PORTS = [139, 445]
 
     @staticmethod
     def check_open(ip: str, port: int = 445, timeout: float = 3.0) -> bool:
