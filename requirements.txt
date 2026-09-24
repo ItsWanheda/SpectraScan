@@ -12,6 +12,7 @@ requests
 fpdf
 pyyaml
 rich>=13.0
+aiohttp>=3.9
 impacket>=0.10.0
 
 
