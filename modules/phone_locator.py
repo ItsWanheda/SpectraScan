@@ -22,7 +22,7 @@ class config:
 
 def main():
     if len(sys.argv) != 2:
-        print(f"Usage: python {sys.argv} <phone_number>")
+        print(f"Usage: python {sys.argv[0]} <phone_number>")
         sys.exit(1)
         
     number = sys.argv[1].strip()
@@ -57,7 +57,7 @@ def main():
         print(f" - Getting Country Name [{'OK' if country_name else 'FAILED'}]")
         print(f" - Getting Location [{'OK' if location else 'FAILED'}]")
         print(f" - Getting Carrier [{'OK' if carrier else 'FAILED'}]")
-        print(f" - Getting Device [{'OK' if line_type else 'FAILED'}]
+        print(f" - Getting Device [{'OK' if line_type else 'FAILED'}]")
         
         print(f"\n{color.YELLOW}[+] Information Output{color.END}")
         print("--------------------------------------")
