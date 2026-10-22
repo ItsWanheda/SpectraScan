@@ -4,6 +4,7 @@ import time
 from urllib.parse import urlencode
 
 import requests
+from packaging.version import InvalidVersion, Version
 
 logger = logging.getLogger(__name__)
 NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -75,13 +76,24 @@ class VulnScanner:
             criteria = term.get("criteria", "")
             parts = criteria.split(":")
             cpe_version = parts[5] if len(parts) > 5 else "*"
-            if cpe_version == self.version:
-                return True
-            # NVD version bounds are inclusive/exclusive and must be respected.
             start_inc, start_exc = term.get("versionStartIncluding"), term.get("versionStartExcluding")
             end_inc, end_exc = term.get("versionEndIncluding"), term.get("versionEndExcluding")
-            if any((start_inc, start_exc, end_inc, end_exc)):
-                # Avoid unsafe lexicographic version comparisons; ambiguous ranges remain potential.
+            try:
+                detected = Version(self.version)
+                if cpe_version not in {"*", "-", ""}:
+                    return detected == Version(cpe_version)
+                if start_inc and detected < Version(start_inc):
+                    continue
+                if start_exc and detected <= Version(start_exc):
+                    continue
+                if end_inc and detected > Version(end_inc):
+                    continue
+                if end_exc and detected >= Version(end_exc):
+                    continue
+                if any((start_inc, start_exc, end_inc, end_exc)):
+                    return True
+            except InvalidVersion:
+                # Version schemes that packaging cannot parse must not be confirmed.
                 return None
         return False
 
