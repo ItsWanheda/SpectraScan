@@ -1,82 +1,181 @@
+"""Credential validation for explicitly authorized SSH/FTP audits.
+
+Never logs or retains plaintext passwords. SSH trusts known-host entries or
+an explicitly configured SHA256 host-key fingerprint.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import logging
+import queue
 import socket
 import threading
-import queue
-import logging
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+def _fingerprint(key: Any) -> str:
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
 
 class BruteForcer:
-    def __init__(self, target, port, service, wordlist_path, max_threads=10):
-        self.target = target
-        self.port = port
-        self.service = service
-        self.wordlist_path = wordlist_path
-        self.max_threads = max_threads
-        self.results = []
+    """Bounded worker queue with explicit result/error categories."""
+
+    def __init__(
+        self, target: str, port: int, service: str, wordlist_path: str,
+        max_threads: int = 10, known_hosts_path: Optional[str] = None,
+        expected_host_fingerprint: Optional[str] = None,
+    ) -> None:
+        self.target = str(target)
+        self.port = int(port)
+        self.service = str(service).lower()
+        self.wordlist_path = str(wordlist_path)
+        if not 1 <= self.port <= 65535:
+            raise ValueError("port must be in the range 1..65535")
+        if self.service not in {"ssh", "ftp"}:
+            raise ValueError("service must be 'ssh' or 'ftp'")
+        if isinstance(max_threads, bool) or not 1 <= int(max_threads) <= 32:
+            raise ValueError("max_threads must be between 1 and 32")
+        self.max_threads = int(max_threads)
+        self.known_hosts_path = known_hosts_path
+        self.expected_host_fingerprint = expected_host_fingerprint
+        self.results: list[Dict[str, Any]] = []
+        self.error_counts: Counter[str] = Counter()
         self.lock = threading.Lock()
 
-    def load_wordlist(self):
+    def load_wordlist(self) -> list[str]:
         try:
-            with open(self.wordlist_path, 'r', errors='ignore') as f:
-                return [line.strip() for line in f if line.strip()]
-        except FileNotFoundError:
-            logging.error(f"Wordlist not found: {self.wordlist_path}")
+            with open(self.wordlist_path, "r", encoding="utf-8", errors="ignore") as stream:
+                return [line.strip() for line in stream if line.strip()]
+        except OSError as exc:
+            logger.error("Unable to read credential wordlist (%s)", type(exc).__name__)
             return []
 
-    def check_ssh(self, username, password):
+    def _record(self, outcome: Dict[str, Any]) -> None:
+        category = str(outcome.get("category", "unknown_error"))
+        with self.lock:
+            if outcome.get("status") == "success":
+                # Whitelist output fields; never persist a password or exception text.
+                self.results.append({
+                    "status": "SUCCESS", "service": self.service,
+                    "target": self.target, "port": self.port,
+                    "username": str(outcome.get("username", "")),
+                    "category": "authenticated",
+                })
+            elif outcome.get("status") == "error":
+                self.error_counts[category] += 1
+
+    def check_ssh(self, username: str, password: str) -> Dict[str, Any]:
         try:
             import paramiko
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(self.target, port=self.port, username=username, password=password, timeout=2)
-            with self.lock:
-                self.results.append({'status': 'SUCCESS', 'user': username, 'pass': password})
-                logging.info(f"[+] SSH Success: {username}:{password}")
-            client.close()
-            return True
-        except Exception:
-            return False
-
-    def check_ftp(self, username, password):
+        except ImportError:
+            return {"status": "error", "category": "dependency_missing"}
+        client = paramiko.SSHClient()
         try:
-            import ftplib
-            ftp = ftplib.FTP()
-            ftp.connect(self.target, self.port, timeout=2)
-            ftp.login(username, password)
-            with self.lock:
-                self.results.append({'status': 'SUCCESS', 'user': username, 'pass': password})
-                logging.info(f"[+] FTP Success: {username}:{password}")
-            ftp.quit()
-            return True
+            client.load_system_host_keys()
+            if self.known_hosts_path:
+                client.load_host_keys(str(Path(self.known_hosts_path).expanduser()))
+            expected = (self.expected_host_fingerprint or "").strip()
+            if expected:
+                class PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+                    def missing_host_key(policy_self, ssh_client, hostname, key):
+                        actual = _fingerprint(key)
+                        if not hmac.compare_digest(actual, expected):
+                            raise paramiko.SSHException("Configured host-key fingerprint mismatch")
+                        ssh_client.get_host_keys().add(hostname, key.get_name(), key)
+                client.set_missing_host_key_policy(PinnedHostKeyPolicy())
+            else:
+                client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            client.connect(
+                self.target, port=self.port, username=username, password=password,
+                timeout=5, banner_timeout=5, auth_timeout=5,
+                allow_agent=False, look_for_keys=False,
+            )
+            remote_key = client.get_transport().get_remote_server_key()
+            if expected and not hmac.compare_digest(_fingerprint(remote_key), expected):
+                return {"status": "error", "category": "host_key_mismatch"}
+            return {"status": "success", "category": "authenticated", "username": username}
+        except paramiko.BadHostKeyException:
+            return {"status": "error", "category": "host_key_mismatch"}
+        except paramiko.AuthenticationException:
+            return {"status": "failed", "category": "invalid_credentials"}
+        except paramiko.SSHException as exc:
+            message = str(exc).lower()
+            category = "host_key_unverified" if "known_hosts" in message or "host key" in message else "ssh_error"
+            return {"status": "error", "category": category}
+        except (socket.timeout, TimeoutError):
+            return {"status": "error", "category": "timeout"}
+        except OSError:
+            return {"status": "error", "category": "connection_error"}
         except Exception:
-            return False
+            return {"status": "error", "category": "ssh_error"}
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
-    def run(self):
+    def check_ftp(self, username: str, password: str) -> Dict[str, Any]:
+        import ftplib
+        ftp = ftplib.FTP()
+        try:
+            ftp.connect(self.target, self.port, timeout=5)
+            ftp.login(username, password)
+            return {"status": "success", "category": "authenticated", "username": username}
+        except ftplib.error_perm:
+            return {"status": "failed", "category": "invalid_credentials"}
+        except (socket.timeout, TimeoutError):
+            return {"status": "error", "category": "timeout"}
+        except OSError:
+            return {"status": "error", "category": "connection_error"}
+        except Exception:
+            return {"status": "error", "category": "ftp_error"}
+        finally:
+            try:
+                ftp.quit()
+            except Exception:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+
+    def run(self) -> list[Dict[str, Any]]:
         wordlist = self.load_wordlist()
         if not wordlist:
-            return
+            return []
+        tasks: queue.Queue[Optional[tuple[str, str]]] = queue.Queue()
+        for password in wordlist:
+            tasks.put(("admin", password))
+            tasks.put(("root", password))
+        worker_count = min(self.max_threads, tasks.qsize())
+        for _ in range(worker_count):
+            tasks.put(None)
 
-        tasks = queue.Queue()
-        threads = []
+        def worker() -> None:
+            while True:
+                item = tasks.get()
+                try:
+                    if item is None:
+                        return
+                    username, password = item
+                    try:
+                        outcome = self.check_ssh(username, password) if self.service == "ssh" else self.check_ftp(username, password)
+                    except Exception:
+                        outcome = {"status": "error", "category": "worker_error"}
+                    self._record(outcome)
+                finally:
+                    tasks.task_done()
 
-        def worker():
-            while not tasks.empty():
-                username, password = tasks.get()
-                if self.service == 'ssh':
-                    self.check_ssh(username, password)
-                elif self.service == 'ftp':
-                    self.check_ftp(username, password)
-                tasks.task_done()
-
-        for _ in range(self.max_threads):
-            t = threading.Thread(target=worker)
-            t.daemon = True
-            t.start()
-            threads.append(t)
-
-        for pwd in wordlist:
-            tasks.put(('admin', pwd))
-            tasks.put(('root', pwd))
-
+        threads = [threading.Thread(target=worker, name=f"spectrascan-auth-{i}", daemon=True) for i in range(worker_count)]
+        for thread in threads:
+            thread.start()
         tasks.join()
-        return self.results
+        for thread in threads:
+            thread.join()
+        return list(self.results)
