@@ -41,7 +41,7 @@ class TestScanModes(unittest.TestCase):
         def fake_probe(port):
             calls.append(port)
             return {"port": port, "protocol": "tcp", "state": "closed", "service": "unknown", "banner": "", "vulnerabilities": []}
-        with patch.object(scanner, "scan_port", side_effect=fake_probe):
+        with patch.object(SpectraScan.PortScanner, "scan_port", fake_probe):
             results = scanner.scan()
         self.assertEqual(len(calls), 500)
         self.assertEqual(results, [])
