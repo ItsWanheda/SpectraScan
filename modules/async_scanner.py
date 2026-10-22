@@ -34,8 +34,11 @@ class AsyncPortScanner:
             raise ValueError(f"timeout must be between 0 and {MAX_TIMEOUT:g} seconds")
         if isinstance(concurrency, bool) or not 1 <= int(concurrency) <= MAX_CONCURRENCY:
             raise ValueError(f"concurrency must be between 1 and {MAX_CONCURRENCY}")
+        raw_ports = list(ports or [])
+        if any(isinstance(port, bool) for port in raw_ports):
+            raise ValueError("ports must be integers in the range 1..65535")
         try:
-            normalized_ports = sorted({int(port) for port in (ports or [])})
+            normalized_ports = sorted({int(port) for port in raw_ports})
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("ports must be integers in the range 1..65535") from exc
         if not normalized_ports:
