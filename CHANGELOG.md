@@ -15,120 +15,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [2.2.0] — 2026-10-22
 
-### 🚀 Added — Dark Web Recon Module
+This release records the feature and hardening work present on \`main\`. The release number follows Semantic Versioning: 2.2.0 is a backward-compatible minor release after 2.1.0.
 
-A brand-new **Dark Web Recon** layer has been integrated as a strictly passive, ethical reconnaissance module.
+### Added
 
-> **Ethical policy:** no marketplace interaction, no payload execution, no illegal content, hard timeouts on every network call, no auto-Tor-launch. Clearnet checks work without Tor; only `.onion` operations require it.
+- **Async TCP scanner:** additive \`AsyncPortScanner\` implementation using \`asyncio\` and \`aiohttp\`, with bounded concurrency and optional HTTP enrichment; the legacy scanner remains available.
+- **Bounded NVD correlation:** optional \`--cve-correlate\` workflow, configurable lookup limits, product identifier validation, NVD pagination/rate-limit handling, and conservative potential-finding semantics.
+- **CIDR scope controls:** explicit target caps, exclusion support, and confirmation for larger network ranges.
+- **Automated quality checks:** test coverage for CLI validation, scanner scheduling, NVD lookup bounds, and report exports where present in the repository test suite.
 
-**New file:** `modules/darkweb.py`
+### Changed
 
-| Feature | Source / API | Auth required |
-|---|---|---|
-| `.onion` v2 / v3 resolve + HTTP banner | Tor SOCKS5 (`127.0.0.1:9050`) via `pysocks` | local Tor |
-| Ahmia search (`.onion` results for a keyword) | `https://ahmia.fi/api/v1/search` | none |
-| PGP public-key lookup by email or name | `https://keys.openpgp.org/vks/v1/...` | none |
-| Email / domain leak & reputation | `https://emailrep.io/` | none |
-| BTC address report (balance, tx count, totals) | `https://blockchain.info/rawaddr/` | none |
-| Structured JSON report | local file | — |
+- Strict CLI parsing rejects unsupported options instead of silently ignoring them.
+- Timing profiles now influence worker-count behavior.
+- Async scan concurrency/timeouts and network scheduling are bounded.
+- Documentation clarifies optional external API use, scan authorization, target limits, and the difference between CVE correlation and a confirmed vulnerability.
 
-**Module design highlights:**
+### Fixed
 
-- Single class `DarkWebScanner` — easy to import as a library.
-- Hard-coded timeouts (HTTP: 15s, `.onion`: 12s, BTC: 10s) prevent runaway connections.
-- Auto-saves results to `~/.local/share/SpectraScan/SS-darkweb-<target>-<timestamp>.json`.
-- Auto-detects whether the target is a BTC address, `.onion`, or generic keyword and pre-selects the appropriate menu item.
-- "Run ALL passive checks" option batches every check that applies to the current target.
-- Full BTC address validation (Base58Check + Bech32/Bech32m per BIP-173/350) before any API call.
-- BTC first-seen timestamp + heuristic risk scoring (0–100, LOW/MEDIUM/HIGH).
-- Onion link extractor with v3 (56-char) and v2 (16-char, deprecated) support.
-- Disposable email domain blocklist and suspicious-TLD flagging.
+- Validate NVD lookup limits and product identifiers before making requests.
+- Correct scanner test mocks and add regression coverage for bounded legacy scan scheduling and CVE/CLI behavior.
+- Preserve UDP uncertainty (\`open|filtered\`) instead of misreporting silence as a confirmed open port.
+- Improve safe report writing and CSV formula-injection handling in the report-export path.
+- Tighten credential-checking behavior: bounded attempts, explicit acknowledgement, trusted SSH host keys or fingerprint pinning, and no plaintext password retention in results.
 
-**CLI integration:**
+### Security
 
-- New entry `14. Dark Web Recon` inside `run_protocol_modules()` (option `3` of the main menu).
-- Old "Back to main menu" entry shifted from `14` → `15`.
-- Graceful degradation: if `pysocks` is missing, the module warns and disables only the `.onion` checks; everything else keeps working.
-- Import errors are caught by the existing `try/except` in the dispatch block, so a missing module cannot abort the rest of the CLI.
+- Keep credential testing opt-in and require explicit acknowledgement.
+- Bound scan scope, concurrency, and external CVE requests to reduce accidental load.
+- Document secret handling, report sensitivity, authorization requirements, and conservative vulnerability classification in README and SECURITY policy.
 
-### 📦 Dependencies
+### Known limitations
 
-- **Added (optional):** `pysocks` — required only for `.onion` resolve + hidden-service banner. The module continues to function without it.
-- `requirements.txt` updated with a documented `pysocks` entry and an explanatory comment block.
-
-### 🧹 Changed
-
-- `run_protocol_modules()` menu header updated to show options `1–15` (added `14. Dark Web Recon`, renumbered back-button to `15`).
-- `run_protocol_modules()` dispatch block updated with the new `elif choice == "14"` branch and shifted back-button check to `"15"`.
-
-### 📝 Documentation
-
-- New **🌑 Dark Web Recon Module** section in `README.md` (features, ethical notes, requirements).
-- New **🔹 Dark Web Recon** usage section in `README.md` explaining the in-menu workflow.
-- Updated **🧭 CLI Menu** table to list `Dark Web Recon` under Protocol Modules.
-- Updated **🧩 Project Structure** to include `modules/darkweb.py`.
-- Updated **📦 Installation** with `pysocks` install line and Tor notes.
-- Updated **🛡️ Security Notes** and **⚠️ Disclaimer** to cover the dark-web functionality.
-
-### ⚠️ Known Issues (`modules/darkweb.py`)
-
-The following bugs were identified during code review of the new module. **All are slated for the next patch release.**
-
-- 🐛 **`detect_target_type()` — list/string type confusion (critical)**
-  In the URL-normalization step, `norm` is reassigned to a list when a scheme (`://`) is present:
-  ```python
-  if "://" in norm:
-      norm = norm.split("://", 1)        # ← returns a list, not a string
-  norm = norm.rstrip("/")...             # ← AttributeError: 'list' object has no 'rstrip'
-  ```
-  This will crash on any input that contains `://`. **Workaround:** strip the scheme manually before calling.
-
-- 🐛 **`_bech32_hrp_expand()` — duplicate `+` operator (critical, blocks import)**
-  ```python
-  return [ord(x) >> 5 for x in hrp] + + [ord(x) & 31 for x in hrp]
-  #                                 ^^ SyntaxError: invalid syntax
-  ```
-  Causes `SyntaxError` at import time on some Python builds. Remove the duplicate `+`.
-
-- 🐛 **`check_tor_connection()` — `body` becomes a list (critical)**
-  ```python
-  body = data.split(b"\r\n\r\n", 1)        # ← list, not bytes
-  j = json.loads(body.decode("utf-8", ...)) # ← AttributeError: list has no 'decode'
-  ```
-  Fix: `body = data.split(b"\r\n\r\n", 1)` or unpack with `header_part, body = ...`.
-
-- 🐛 **`grab_onion_banner()` — malformed status-line extraction (critical)**
-  ```python
-  status_line = lines if lines else ""     # ← assigns the whole list, not the first line
-  "status_code": int(status_line.split())  # ← TypeError: int() with list
-  ```
-  Fix: `status_line = lines if lines else ""` and `int(status_line.split())`.
-
-- 🐛 **`grab_onion_banner()` — broken host/port/path parsing (critical)**
-  The `host_part = target.split("/", 1)` block does not extract `host` correctly and produces a malformed `path` string of the form `"/['onion']"`. The entire branch needs restructuring.
-
-- ⚠️ **Documentation drift:** the module docstring lists `emailrep.io` and PGP features as implemented, but the current code only implements `ahmia_search` and `btc_first_seen`. The README accurately reflects actual functionality; the module docstring should be trimmed.
-
-- ⚠️ **`datetime.utcnow()` deprecation:** used in `btc_first_seen._age()` and elsewhere. Will emit `DeprecationWarning` on Python 3.12+; replace with `datetime.now(timezone.utc)`.
-
-- ⚠️ **BTC validator naming collision:** `decoded` is used as both the witness-version int and the witness-program bytes list inside `validate_btc_address()`. Works correctly but is fragile.
-
-### 📂 Files
-
-**New:**
-- `modules/darkweb.py`
-
-**Modified:**
-- `SpectraScan.py` (menu header + dispatch block only)
-- `README.md`
-- `CHANGELOG.md`
-- `requirements.txt`
+- Version comparison is conservative and may not correctly interpret every vendor-specific, epoch, or prerelease version scheme. Ambiguous versions must not be treated as confirmed affected versions.
+- A matching service banner/CPE and CVE version range is not proof of exploitability; validate findings against authoritative vendor advisories and the actual target configuration.
+- Optional protocol and OSINT modules may behave differently across platforms; interpret each module's output and errors accordingly.
 
 ---
 
-## [released]
+## [Unreleased]
+
+### Planned
+
+- Named scope-aware scan profiles with effective-configuration preview and hard allowlist enforcement.
+- Normalized evidence-based findings and unified JSON/CSV/HTML/Markdown/SARIF exports.
+- Deeper read-only web/TLS checks, historical scan diffs, and a common plugin/protocol registry.
+- IPv6 integration, passive subdomain/certificate-transparency discovery, DNS security checks, and a reproducible Docker workflow.
 
 ---
 
