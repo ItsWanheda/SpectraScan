@@ -31,6 +31,7 @@ class BruteForcer:
         self, target: str, port: int, service: str, wordlist_path: str,
         max_threads: int = 10, known_hosts_path: Optional[str] = None,
         expected_host_fingerprint: Optional[str] = None,
+        max_passwords: int = 100,
     ) -> None:
         self.target = str(target)
         self.port = int(port)
@@ -45,6 +46,9 @@ class BruteForcer:
         self.max_threads = int(max_threads)
         self.known_hosts_path = known_hosts_path
         self.expected_host_fingerprint = expected_host_fingerprint
+        if isinstance(max_passwords, bool) or not 1 <= int(max_passwords) <= 1000:
+            raise ValueError("max_passwords must be between 1 and 1000")
+        self.max_passwords = int(max_passwords)
         if self.expected_host_fingerprint and not self.expected_host_fingerprint.startswith("SHA256:"):
             raise ValueError("expected_host_fingerprint must use the OpenSSH SHA256: format")
         self.results: list[Dict[str, Any]] = []
@@ -53,8 +57,16 @@ class BruteForcer:
 
     def load_wordlist(self) -> list[str]:
         try:
+            words = []
             with open(self.wordlist_path, "r", encoding="utf-8", errors="ignore") as stream:
-                return [line.strip() for line in stream if line.strip()]
+                for line in stream:
+                    candidate = line.strip()
+                    if not candidate:
+                        continue
+                    words.append(candidate)
+                    if len(words) >= self.max_passwords:
+                        break
+            return words
         except OSError as exc:
             logger.error("Unable to read credential wordlist (%s)", type(exc).__name__)
             return []
