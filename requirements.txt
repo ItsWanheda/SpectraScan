@@ -35,3 +35,4 @@ python-whois
 # PGP, BTC and email reputation does not
 # require Tor.
 pysocks
+cryptography>=41.0
