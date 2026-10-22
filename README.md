@@ -553,6 +553,17 @@ Available operations:
 | `7` | Full recon | Depends |
 | `8` | Back | — |
 
+### Evidence-based CVE correlation
+
+The optional NVD correlation mode is separate from local port/service heuristics so ordinary scans do not unexpectedly make external API calls:
+
+```bash
+python SpectraScan.py -t 127.0.0.1 -p 22,80,443 --cve-correlate -o findings.json
+python SpectraScan.py -t 127.0.0.1 -p 22,80,443 --cve-correlate --max-cve-lookups 5 -o findings.json
+```
+
+Only distinct detected products with a usable version are queried; at most 3 lookups run by default (maximum 20). Configure `NVD_API_KEY` through the environment. Static CPE/version matches are classified as **potential** unless there is stronger evidence; they are not proof of exploitability.
+
 ### 📊 Reports
 
 ```bash
