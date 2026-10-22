@@ -9,6 +9,7 @@ scapy
 python-nmap
 paramiko
 requests
+packaging>=23.2
 fpdf
 pyyaml
 rich>=13.0
