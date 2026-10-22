@@ -35,7 +35,7 @@ def main():
 
     try:
         output = requests.get(
-            "https://api.apilayer.net/api/validate",
+            "https://apilayer.net/api/validate",
             params={
                 "access_key": config.key,
                 "number": number,
