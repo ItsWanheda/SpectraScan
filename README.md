@@ -8,7 +8,7 @@
   <a href="https://github.com/ItsWanheda/SpectraScan/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
   </a>
-  <img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg" alt="Platform">
   <img src="https://img.shields.io/badge/Status-Stable-brightgreen.svg" alt="Status">
   <img src="https://img.shields.io/badge/Code%20Style-Black-000000.svg" alt="Black">
@@ -32,6 +32,12 @@
 </div>
 
 ---
+
+## 📦 Current release: 2.2.0
+
+The current `main` branch contains the 2.2.0 feature set. This release builds on 2.1.0 with an additive async TCP scanner, bounded optional NVD CVE correlation, stricter CLI validation, bounded CIDR scans, safer credential-checking defaults, and more reliable report exports. See [CHANGELOG.md](CHANGELOG.md) for detailed release notes and [SECURITY.md](SECURITY.md) for supported versions and vulnerability reporting.
+
+> **Release integrity:** this documents the `main` code state; it does not claim a GitHub Release or PyPI package has been published.
 
 ## 📑 Table of Contents
 
@@ -57,6 +63,8 @@
 - [🩺 Troubleshooting](#-troubleshooting)
 - [🛣️ Roadmap](#-roadmap)
 - [🛡️ Security Notes](#-security-notes)
+- [🧾 Changelog](CHANGELOG.md)
+- [🔐 Security Policy](SECURITY.md)
 - [🤝 Contributing](#-contributing)
 - [🙏 Acknowledgements](#-acknowledgements)
 - [⚠️ Disclaimer](#-disclaimer)
@@ -787,30 +795,43 @@ CIDR scans have a hard address limit set by --max-targets (default 1024), and sc
 
 ## 🛣️ Roadmap
 
-- [x] Async scanner engine with `asyncio` + `aiohttp`
-- [ ] Kerberos enumeration + AS-REP roasting detection
-- [ ] Subdomain permutation engine
-- [ ] Email-to-username correlation workflows
+The items below are planned work, not claims of already-shipped functionality. Priorities favor correctness and consistent data models before expanding the module count.
+
+### Highest priority
+
+- [ ] **Network scope and scan profiles** — named \`Quick\`, \`Full TCP\`, \`Web Assessment\`, and \`Local Network\` profiles; explicit allowlists/exclusions, host caps, timeouts, concurrency and rate limits; show effective configuration and reject out-of-scope targets before scanning.
+- [ ] **Evidence-based vulnerability findings** — normalized product/CPE/version evidence; \`Confirmed\`, \`Potential\`, and \`Informational\` classifications; confidence rationale, affected version ranges, CVSS data, references, and remediation guidance. Banner matches alone are not proof of exploitability.
+- [ ] **Deeper web/TLS audit** — certificate validity/expiry and chain checks, protocol/cipher support, cookie flags, redirect behavior, and security-header analysis. Keep checks read-only by default and separate observations from confirmed vulnerabilities.
+- [ ] **Historical scan comparison** — compare authorized scan snapshots for new/resolved ports, changed service versions, and changed findings.
+- [ ] **Unified reporting** — JSON, CSV, HTML, Markdown, and SARIF generated from one normalized finding model.
+- [ ] **Plugin/protocol interface** — standard inputs, deadlines, cancellation, output schema, permissions, and error handling behind a module registry rather than continuing to grow the main entry point.
+- [ ] **IPv6 support** — integrate IPv6 targets and compatible discovery/probing into the same scan interface; improve UDP/service detection through shared result semantics.
+
+### Later candidates
+
+- [ ] Passive subdomain discovery and certificate-transparency monitoring
+- [ ] DNS security checks
+- [ ] Docker image and reproducible container workflow
+- [ ] Kerberos enumeration and AS-REP roasting detection
+- [ ] Subdomain permutation and email-to-username correlation
 - [ ] WebSocket / GraphQL introspection
 - [ ] Multi-user collaboration and scan sharing
-- [ ] Machine-learning anomaly detection
-- [ ] Official Docker image
-- [ ] GitHub Actions CI/CD
-- [ ] Plugin system for custom modules
-
+- [ ] Machine-learning anomaly detection, if validated against a useful baseline
+- [ ] CI coverage for supported operating systems and Python versions
 ---
 
 ## 🛡️ Security Notes
 
-- Credential-testing modules include rate limiting, jitter, and timeout controls.
-- External APIs are treated as optional dependencies and can fail gracefully.
-- Some features require elevated privileges or platform-specific support.
-- Cross-platform support targets Linux, Windows, and macOS.
-- Dark Web Recon is designed for passive reconnaissance and does not
-  intentionally download binaries, interact with marketplaces, or execute payloads.
-- **Authorization is your responsibility.** Always obtain permission before
-  probing external infrastructure.
-
+- **Scope first:** scan only assets you own or are explicitly authorized to assess. Review targets, exclusions, and scan intensity before running active checks.
+- Credential testing is opt-in and uses bounded attempts, timeouts, throttling/back-off, and trusted SSH host keys or an explicitly pinned SHA-256 fingerprint. Never put passwords, API keys, or other secrets in source control or reports.
+- HTTPS certificate verification is enabled for async HTTP enrichment; do not disable TLS validation to work around target errors.
+- CIDR scans are bounded by \`--max-targets\` (default 1024); scans larger than 64 addresses require explicit \`--yes\` confirmation. UDP silence is reported as \`open|filtered\` rather than confirmed open.
+- NVD CVE correlation is optional and bounded. A CPE/version correlation is evidence to investigate, not proof that a target is exploitable. Version parsing has limits for vendor-specific and prerelease formats.
+- Reports may contain sensitive asset details, banners, addresses, and findings. Restrict filesystem access and sanitize before sharing.
+- External APIs and optional dependencies can fail or rate-limit; interpret incomplete results accordingly.
+- Dark Web Recon is intended for passive research; do not use it to access illegal content, interact with marketplaces, or conduct unauthorized activity.
+- Some features require elevated privileges or platform-specific support. Cross-platform support targets Linux, Windows, and macOS.
+- See [SECURITY.md](SECURITY.md) for supported versions and private vulnerability disclosure.
 ---
 
 ## 🤝 Contributing
@@ -847,7 +868,7 @@ git push origin feature/AmazingFeature
 - CI improvements
 - Documentation improvements
 
-Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a large PR.
+Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a large PR. Report security vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md).
 
 ---
 
