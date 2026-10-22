@@ -77,6 +77,17 @@ class TestCliIntegration(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("unrecognized arguments", result.stderr)
 
+    def test_html_extension_selects_html_without_format_flag(self):
+        port = self._listener()
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "scan.html"
+            result = self._run(
+                "-t", "127.0.0.1", "-p", str(port), "--threads", "2",
+                "--timeout", "0.3", "-o", output, cwd=temp,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr + result.stdout)
+            self.assertTrue(output.read_text(encoding="utf-8").lstrip().lower().startswith("<!doctype html>"))
+
     def test_invalid_port_range_is_rejected_before_network_access(self):
         with tempfile.TemporaryDirectory() as temp:
             result = self._run("-t", "127.0.0.1", "-p", "0,70000", cwd=temp)
