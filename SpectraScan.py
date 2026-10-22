@@ -4303,10 +4303,26 @@ class ReportManager:
         self.current_file = None
         self.append_file = False
 
-    def save_output(self):
-        # In CLI mode, we might skip auto-prompting if not explicitly asked, 
-        # but we keep the logic for consistency.
-        pass 
+    def save_output(self, filename=None, content=None):
+        """Atomically save report content under the configured report directory."""
+        if filename is None or content is None:
+            return None
+        safe_name = os.path.basename(str(filename))
+        if not safe_name or safe_name in {".", ".."}:
+            raise ValueError("invalid report filename")
+        os.makedirs(self.report_dir, exist_ok=True)
+        destination = os.path.join(self.report_dir, safe_name)
+        temporary = destination + ".tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8", newline="") as handle:
+                handle.write(str(content))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        return destination
 
     def write(self, text):
         # In CLI mode, we can just print to console directly
@@ -6867,7 +6883,12 @@ def main():
         parser.error("--async-scan currently supports TCP only")
 
     try:
-        target = normalize_target(target)
+        try:
+            target = str(ipaddress.ip_address(target))
+        except ValueError:
+            target = normalize_target(target)
+        if "/" in target:
+            parser.error("a single target is required; use the network-scan menu for CIDR ranges")
         resolved_ip = resolve_host(target)
         if args.scan_type == "udp":
             if args.async_scan:
