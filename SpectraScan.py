@@ -16,6 +16,7 @@ import os
 import logging
 import math
 import queue
+import threading
 import ssl
 import subprocess
 import re
@@ -40,6 +41,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from modules.async_scanner import AsyncPortScanner
 from modules.report_store import ReportStore, atomic_write_text, atomic_write_json, safe_csv_cell
+from modules.web_enumerator import WebEnumerator
 import io
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "modules"))
@@ -4385,19 +4387,21 @@ def normalize_target(target: str) -> str:
 
 
 def resolve_host(hostname: str) -> str:
-    """Resolve a single host/IP. CIDR networks are handled separately."""
+    """Resolve a single host or IP. CIDR networks must use the network-scan path."""
     target = normalize_target(hostname)
-
     if not target:
         raise ValueError("Target cannot be empty")
-
     try:
-        network = ipaddress.ip_network(target, strict=False)
-        raise ValueError(f"CIDR network detected: {network}")
-    except ValueError as exc:
-        if "CIDR network detected" in str(exc):
-            raise
-
+        return str(ipaddress.ip_address(target))
+    except ValueError:
+        pass
+    if "/" in target:
+        try:
+            network = ipaddress.ip_network(target, strict=False)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"CIDR network detected: {network}")
     try:
         return socket.gethostbyname(target)
     except socket.gaierror as exc:
@@ -6879,7 +6883,7 @@ def main(argv: Optional[List[str]] = None):
             if report is None:
                 parser.error("domain scan could not validate the requested domain")
             if args.output:
-                saved = _write_cli_report(report, args.output, args.format or "json")
+                saved = _write_cli_report(report, args.output, args.format)
                 console.print(f"[green][+] Report saved: {saved}[/green]")
             return 0
         if args.ip:
@@ -6893,7 +6897,7 @@ def main(argv: Optional[List[str]] = None):
                 "timestamp": datetime.now().isoformat(), "output": manager._buffer,
             }
             if args.output:
-                saved = _write_cli_report(report, args.output, args.format or "json")
+                saved = _write_cli_report(report, args.output, args.format)
                 console.print(f"[green][+] Report saved: {saved}[/green]")
             return 0
 
@@ -6923,10 +6927,10 @@ def main(argv: Optional[List[str]] = None):
                 parser.error("async scans over 10000 ports require --yes")
 
         scan_kwargs = {
-            "timeout": args.timeout if args.timeout is not None else 1.0,
+            "timeout": args.timeout if args.timeout is not None else TIMING_PROFILES[args.timing]["timeout"],
             "threads": args.threads,
             "scan_type": args.scan_type,
-            "timing": "custom" if args.timeout is not None else args.timing,
+            "timing": "custom",
             "ports": ports, "decoys": [], "check_vulns": args.vuln_scan, "rate_limit": 0,
         }
         if is_network:
@@ -6945,10 +6949,7 @@ def main(argv: Optional[List[str]] = None):
                 "timestamp": datetime.now().isoformat(), "hosts": results, "open_ports": [],
             }
         else:
-            try:
-                resolved_ip = resolve_host(target)
-            except (ValueError, socket.gaierror) as exc:
-                parser.error(str(exc))
+            resolved_ip = None
             if args.async_scan:
                 scanner = AsyncPortScanner(
                     target, ports=ports, timeout=args.async_timeout,
@@ -6956,10 +6957,17 @@ def main(argv: Optional[List[str]] = None):
                 )
                 try:
                     scanner.scan()
+                    resolved_ip = scanner.resolved_ip
                     report = scanner.get_results()
                 except (ValueError, OSError, asyncio.TimeoutError) as exc:
                     parser.error(f"async scan failed: {exc}")
             else:
+                try:
+                    resolved_ip = resolve_host(target)
+                    if ipaddress.ip_address(resolved_ip).version == 6:
+                        parser.error("single IPv6 targets require --async-scan; legacy TCP/SYN/UDP scanners are IPv4-only")
+                except ValueError as exc:
+                    parser.error(str(exc))
                 scanner = PortScanner(target, **scan_kwargs)
                 scanner.resolved_ip = resolved_ip
                 scanner.scan()
@@ -6974,7 +6982,7 @@ def main(argv: Optional[List[str]] = None):
                 base_url = target if target.lower().startswith(("http://", "https://")) else "http://" + target
                 report["web_enumeration"] = WebEnumerator(base_url, args.wordlist).run()
         if args.output:
-            saved = _write_cli_report(report, args.output, args.format or "json")
+            saved = _write_cli_report(report, args.output, args.format)
             console.print(f"[green][+] Report saved: {saved}[/green]")
         elif args.scan_type == "udp":
             console.print("[yellow]UDP silence is reported as open|filtered; it is not proof of an open port.[/yellow]")
