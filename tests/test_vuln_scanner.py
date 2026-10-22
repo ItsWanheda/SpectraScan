@@ -31,7 +31,7 @@ class TestVulnScanner(unittest.TestCase):
         self.assertEqual(found[0]["severity"], "UNKNOWN")
         self.assertIn(found[0]["classification"], {"potential", "informational", "confirmed"})
 
-    def test_exact_cpe_version_range_classified_confirmed(self):
+    def test_exact_cpe_version_range_is_potential_without_live_confirmation(self):
         scanner = VulnScanner("openssh", "9.1", vendor="openbsd", product="openssh")
         cve = {
             "configurations": [{
@@ -71,6 +71,12 @@ class TestVulnScanner(unittest.TestCase):
         self.assertEqual(report["findings"][0]["ports"], [22, 2222])
         self.assertEqual(factory.call_args.kwargs["vendor"], "openbsd")
         self.assertEqual(factory.call_args.kwargs["product"], "openssh")
+
+    def test_cve_lookup_limit_cli_argument_requires_flag(self):
+        parser = SpectraScan._cli_parser()
+        args = parser.parse_args(["-t", "127.0.0.1", "--max-cve-lookups", "5"])
+        self.assertEqual(args.max_cve_lookups, 5)
+        self.assertFalse(args.cve_correlate)
 
     def test_cli_cve_correlation_limit_is_validated(self):
         with self.assertRaises(ValueError):
