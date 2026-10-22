@@ -6547,6 +6547,10 @@ def run_port_scan_cli():
         default="tcp",
     )
 
+    if scan_type == "syn" and not SYNScan().is_admin:
+        console.print("[!] SYN scans require root/administrator privileges. Returning to menu.", style="bold red")
+        return
+
     timing = Prompt.ask(
         "Timing Profile",
         choices=["T0", "T1", "T2", "T3", "T4", "T5"],
@@ -6862,6 +6866,8 @@ def main(argv: Optional[List[str]] = None):
             parser.error("--async-scan supports only --scan-type tcp")
         if args.async_scan and args.timeout is not None:
             parser.error("use --async-timeout with --async-scan instead of --timeout")
+        if args.scan_type == "syn" and not SYNScan().is_admin:
+            parser.error("--scan-type syn requires root/administrator privileges; no TCP-connect fallback is performed")
         if args.web_enum and not args.wordlist:
             parser.error("--web-enum requires --wordlist")
         if args.format and not args.output:
