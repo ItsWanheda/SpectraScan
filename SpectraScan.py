@@ -6016,7 +6016,7 @@ class DomainScanner:
     def _infrastructure(cls, dns_data):
         ips = dns_data.get("resolved_ips", [])
         result = {"ips": ips, "reverse_dns": cls._reverse_dns(ips)}
-        api_key = os.environ.get("SHODAN_API_KEY")
+        api_key = os.environ.get("SHODAN_API_KEY") or os.environ.get("SHODAN_KEY")
         if api_key and ips:
             try:
                 import requests
@@ -6233,7 +6233,7 @@ class PhoneScanner:
         report_manager.write("-------------------------------------------------------------------------------")
 
         # Uses the external python script from the original codebase
-        script_path = os.path.join(os.path.dirname(__file__), "modules", "phone_scanner.py")
+        script_path = os.path.join(os.path.dirname(__file__), "modules", "phone_locator.py")
         if os.path.exists(script_path):
             try:
                 result = subprocess.run(
@@ -6823,9 +6823,10 @@ def _cli_parser():
     parser.add_argument("--brute-force", action="store_true", help="Run bounded SSH/FTP credential validation against an authorized target")
     parser.add_argument("--service", choices=("ssh", "ftp"), help="Service for --brute-force")
     parser.add_argument("--port", type=int, help="Service port for --brute-force")
-    parser.add_argument("--max-attempts", type=int, default=100, help="Maximum passwords from the wordlist (1-1000)")
+    parser.add_argument("--max-attempts", type=int, default=None, help="Maximum passwords from the wordlist (1-1000; only for --brute-force)")
     parser.add_argument("--ssh-known-hosts", help="Optional SSH known_hosts file")
     parser.add_argument("--ssh-host-fingerprint", help="Pin SSH host key using OpenSSH SHA256: fingerprint")
+    parser.add_argument("--allow-insecure-ftp", action="store_true", help="Allow plaintext FTP credentials (unsafe; requires --yes and --service ftp)")
     parser.add_argument("--smb", action="store_true", help="Run SMB enumeration against --target")
     parser.add_argument("--ldap", action="store_true", help="Run LDAP enumeration against --target")
     parser.add_argument("--dns-zone", action="store_true", help="Check DNS zone transfer against --domain")
@@ -6893,12 +6894,16 @@ def main(argv: Optional[List[str]] = None):
                 parser.error("--brute-force requires explicit confirmation with --yes")
             if not 1 <= args.port <= 65535:
                 parser.error("--port must be between 1 and 65535")
+            if args.max_attempts is None:
+                args.max_attempts = 100
             if not 1 <= args.max_attempts <= 1000:
                 parser.error("--max-attempts must be between 1 and 1000")
             if args.service != "ssh" and args.ssh_host_fingerprint:
                 parser.error("--ssh-host-fingerprint is only valid with --service ssh")
-        elif args.service or args.port is not None or args.ssh_known_hosts or args.ssh_host_fingerprint:
-            parser.error("--service, --port, and SSH host-key options require --brute-force")
+            if args.allow_insecure_ftp and args.service != "ftp":
+                parser.error("--allow-insecure-ftp requires --service ftp")
+        elif args.service or args.port is not None or args.ssh_known_hosts or args.ssh_host_fingerprint or args.allow_insecure_ftp or args.max_attempts is not None:
+            parser.error("--service, --port, SSH host-key options, --allow-insecure-ftp, and --max-attempts require --brute-force")
         if args.email and not EMAIL_REGEX.fullmatch(args.email):
             parser.error("--email must be a valid email address")
         if args.phone and detect_target_type(args.phone).get("type") != "phone":
@@ -6998,6 +7003,7 @@ def main(argv: Optional[List[str]] = None):
                     known_hosts_path=args.ssh_known_hosts,
                     expected_host_fingerprint=args.ssh_host_fingerprint,
                     max_passwords=args.max_attempts,
+                    allow_insecure_ftp=args.allow_insecure_ftp,
                 )
                 modules["credential_validation"] = {
                     "target": resolved_ip, "port": args.port, "service": args.service,
