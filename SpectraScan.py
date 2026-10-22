@@ -4515,72 +4515,60 @@ class RateLimiter:
 
 # ============== SYN Scanner ==============
 class SYNScan:
-    __slots__ = ("is_admin",)
-    
     def __init__(self):
         self.is_admin = os.geteuid() == 0 if hasattr(os, "geteuid") else False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                self.is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                self.is_admin = False
 
     def create_packet(self, src_ip: str, dst_ip: str, dst_port: int) -> bytes:
         ip_header = struct.pack(
-            "!BBHHHBBH4s4s",
-            0x45,
-            0,
-            40,
-            random.randint(1, 65535),
-            0,
-            64,
-            6,
-            0,
-            socket.inet_aton(src_ip),
-            socket.inet_aton(dst_ip),
+            "!BBHHHBBH4s4s", 0x45, 0, 40, random.randint(1, 65535),
+            0, 64, 6, 0, socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
         )
         tcp_header = struct.pack(
-            "!HHLLBBHHH",
-            random.randint(1024, 65535),
-            dst_port,
-            random.randint(0, 4294967295),
-            0,
-            0x50,
-            0x02,
-            65535,
-            0,
-            0,
+            "!HHLLBBHHH", random.randint(1024, 65535), dst_port,
+            random.randint(0, 4294967295), 0, 0x50, 0x02, 65535, 0, 0,
         )
         return ip_header + tcp_header
 
     def scan(self, target_ip: str, port: int, timeout: float = 2.0) -> str:
-        # Fall back to TCP connect scan if we don't have raw socket privileges
+        """Perform a real half-open SYN probe; never silently fall back to TCP connect."""
         if not self.is_admin:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                rc = sock.connect_ex((target_ip, port))
-                sock.close()
-                if rc == 0:
-                    return "open"
-                elif rc in (111, 10061):  # ECONNREFUSED
-                    return "closed"
-                else:
-                    return "filtered"
-            except socket.timeout:
-                return "filtered"
-            except:
-                return "error"
+            return "error"
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-            sock.settimeout(timeout)
-            packet = self.create_packet(get_local_ip(), target_ip, port)
-            sock.sendto(packet, (target_ip, 0))
-            data, _ = sock.recvfrom(1024)
-            sock.close()
-            tcp_flags = data[20 + 13]
-            if tcp_flags & 0x12:
+            from scapy.all import IP, TCP, RandShort, sr1, send
+            source_port = int(RandShort())
+            probe = IP(dst=target_ip) / TCP(sport=source_port, dport=port, flags="S")
+            reply = sr1(probe, timeout=timeout, verbose=0)
+            if reply is None:
+                return "filtered"
+            if not reply.haslayer(TCP):
+                return "filtered"
+            flags = int(reply[TCP].flags)
+            if flags & 0x12 == 0x12:
+                # Reset the half-open connection after observing a SYN-ACK.
+                try:
+                    reset = IP(dst=target_ip) / TCP(
+                        sport=source_port, dport=port, flags="R", seq=int(reply[TCP].ack)
+                    )
+                    send(reset, verbose=0)
+                except Exception:
+                    pass
                 return "open"
-            elif tcp_flags & 0x14 or tcp_flags & 0x04:
+            if flags & 0x04 or flags & 0x14:
                 return "closed"
             return "filtered"
-        except:
+        except ImportError:
+            return "error"
+        except PermissionError:
+            return "error"
+        except OSError:
+            return "error"
+        except Exception:
             return "error"
 
 # ============== UDP Scanner ==============
@@ -6462,6 +6450,12 @@ def run_network_port_scan(
     for excluded in excluded_networks:
         if excluded.version != network.version:
             raise ValueError(f"Exclusion {excluded} uses a different IP version from {network}.")
+    # Avoid multiplying host workers by a full-size port pool per host.
+    bounded_scan_kwargs = dict(scan_kwargs)
+    bounded_scan_kwargs["threads"] = min(
+        max(1, int(bounded_scan_kwargs.get("threads", 100))),
+        max(1, 128 // int(host_workers)),
+    )
     work_queue = queue.Queue(maxsize=max(2, host_workers * 2))
     sentinel = object()
     results = []
@@ -6488,7 +6482,7 @@ def run_network_port_scan(
                     return
                 ip_text = str(item)
                 try:
-                    scanner = PortScanner(ip_text, **scan_kwargs)
+                    scanner = PortScanner(ip_text, **bounded_scan_kwargs)
                     scanner.resolved_ip = ip_text
                     scanner.scan()
                     if scanner.results:
