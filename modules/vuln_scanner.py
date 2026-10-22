@@ -19,7 +19,11 @@ def _version_key(value: str) -> Optional[tuple]:
     if not value or not re.fullmatch(r"\d+(?:\.\d+){0,7}", value):
         return None
     try:
-        return tuple(int(part) for part in value.split("."))
+        parts = [int(part) for part in value.split(".")]
+        # Treat release notation such as 9.1 and 9.1.0 as equivalent.
+        while len(parts) < 8:
+            parts.append(0)
+        return tuple(parts)
     except ValueError:
         return None
 
@@ -160,7 +164,9 @@ class VulnScanner:
             for key in ("versionStartIncluding", "versionStartExcluding", "versionEndIncluding", "versionEndExcluding"):
                 if matched.get(key):
                     evidence.append(f"{key}={matched[key]}")
-            return "confirmed", evidence
+            # Static version/CPE correlation is evidence of potential exposure, not live confirmation.
+            evidence.append("This is a version-based correlation only; verify exploit preconditions before treating it as confirmed.")
+            return "potential", evidence
         if self.cpe:
             evidence.append("NVD returned the exact CPE query, but no corroborating affected-version range was exposed.")
             return "potential", evidence
