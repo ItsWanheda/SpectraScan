@@ -32,6 +32,7 @@ class BruteForcer:
         max_threads: int = 10, known_hosts_path: Optional[str] = None,
         expected_host_fingerprint: Optional[str] = None,
         max_passwords: int = 100,
+        allow_insecure_ftp: bool = False,
     ) -> None:
         self.target = str(target)
         self.port = int(port)
@@ -49,6 +50,7 @@ class BruteForcer:
         if isinstance(max_passwords, bool) or not 1 <= int(max_passwords) <= 1000:
             raise ValueError("max_passwords must be between 1 and 1000")
         self.max_passwords = int(max_passwords)
+        self.allow_insecure_ftp = bool(allow_insecure_ftp)
         if self.expected_host_fingerprint and not self.expected_host_fingerprint.startswith("SHA256:"):
             raise ValueError("expected_host_fingerprint must use the OpenSSH SHA256: format")
         self.results: list[Dict[str, Any]] = []
@@ -139,11 +141,16 @@ class BruteForcer:
                 pass
 
     def check_ftp(self, username: str, password: str) -> Dict[str, Any]:
-        import ftplib
-        ftp = ftplib.FTP()
+        # FTP is plaintext unless explicit FTPS is used. The insecure path must be
+        # deliberately opted into by the caller for isolated legacy test systems.
+        import ftplib  # nosec B402 - FTPS is the default; plain FTP requires explicit opt-in.
+
+        ftp = (ftplib.FTP() if self.allow_insecure_ftp else ftplib.FTP_TLS())  # nosec B321 - plain FTP is explicit opt-in only
         try:
             ftp.connect(self.target, self.port, timeout=5)
             ftp.login(username, password)
+            if not self.allow_insecure_ftp:
+                ftp.prot_p()
             return {"status": "success", "category": "authenticated", "username": username}
         except ftplib.error_perm:
             return {"status": "failed", "category": "invalid_credentials"}
@@ -161,7 +168,6 @@ class BruteForcer:
                     ftp.close()
                 except Exception:
                     pass
-
     def run(self) -> list[Dict[str, Any]]:
         self.results = []
         self.error_counts.clear()
