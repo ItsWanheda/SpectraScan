@@ -4979,31 +4979,33 @@ class ARPScanner:
     def scan(network: str) -> List[Dict]:
         hosts = []
         try:
-            # Determine the network prefix (e.g., "192.168.1.") for membership testing
             try:
-                net = ipaddress.ip_network(network, strict=False)
-                net_hosts = {str(ip) for ip in net.hosts()}
+                network_obj = ipaddress.ip_network(network, strict=False)
             except ValueError:
-                net_hosts = None
+                network_obj = None
 
             cmd = ["arp", "-a"] if sys.platform == "win32" else ["arp", "-a", "-n"]
-            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
-            for line in output.split("\n"):
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode(errors="replace")
+            for line in output.splitlines():
                 match = re.search(
                     r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-f:-]+)\s+(\w+)",
                     line,
                     re.IGNORECASE,
                 )
-                if match:
-                    ip, mac, iface = match.groups()
-                    if net_hosts is None:
-                        if ip.startswith(".".join(network.split(".")[:3]) + "."):
-                            hosts.append({"ip": ip, "mac": mac, "interface": iface})
-                    else:
-                        if ip in net_hosts:
-                            hosts.append({"ip": ip, "mac": mac, "interface": iface})
-        except Exception as e:
-            print(f"{RED}[-] ARP scan error: {e}{RESET}")
+                if not match:
+                    continue
+                ip, mac, iface = match.groups()
+                if network_obj is not None:
+                    try:
+                        if ipaddress.ip_address(ip) not in network_obj:
+                            continue
+                    except ValueError:
+                        continue
+                elif not ip.startswith(".".join(network.split(".")[:3]) + "."):
+                    continue
+                hosts.append({"ip": ip, "mac": mac, "interface": iface})
+        except Exception as exc:
+            print(f"{RED}[-] ARP scan error: {type(exc).__name__}{RESET}")
         return hosts
 
 # ============== Traceroute ==============
@@ -5045,6 +5047,7 @@ class PortScanner:
         "vulnerabilities",
         "start_time",
         "rate_limiter",
+        "result_lock",
     )
     
     def __init__(self, target: str, **kwargs):
@@ -5062,10 +5065,13 @@ class PortScanner:
         self.vulnerabilities = []
         self.start_time = None
         self.rate_limiter = RateLimiter(self.rate_limit) if self.rate_limit else None
+        self.result_lock = threading.Lock()
         if self.timing in TIMING_PROFILES:
             profile = TIMING_PROFILES[self.timing]
             self.threads = profile["threads"]
             self.timeout = profile["timeout"]
+        # Keep total worker creation bounded even under the most aggressive profile.
+        self.threads = max(1, min(int(self.threads), 128))
 
     def initialize(self):
         print(f"\n{BOLD}{CYAN}{'='*60}")
@@ -5113,7 +5119,8 @@ class PortScanner:
                 result["version_info"] = identify_service(result["banner"])
                 if self.check_vulns:
                     result["vulnerabilities"] = check_vulnerabilities(port, service_value, result["banner"])
-                    self.vulnerabilities.extend(result["vulnerabilities"])
+                    with self.result_lock:
+                        self.vulnerabilities.extend(result["vulnerabilities"])
             return result
         result = {
             "port": port, "protocol": "tcp", "state": "closed",
@@ -5143,17 +5150,46 @@ class PortScanner:
         return result
 
     def scan(self) -> List[Dict]:
+        """Scan ports with a bounded queue; submit only one worker task per thread."""
         self.start_time = time.time()
         self.results = []
         self.vulnerabilities = []
         print(f"{CYAN}[*] Spectra is scanning...\n")
+        sentinel = object()
+        work_queue = queue.Queue(maxsize=max(2, self.threads * 2))
+
+        def worker():
+            while True:
+                port = work_queue.get()
+                try:
+                    if port is sentinel:
+                        return
+                    try:
+                        result = self.scan_port(port)
+                    except Exception as exc:
+                        result = {
+                            "port": port, "protocol": "udp" if self.scan_type == "udp" else "tcp",
+                            "state": "error", "service": COMMON_PORTS.get(port, "unknown"),
+                            "banner": "", "error": type(exc).__name__, "vulnerabilities": [],
+                        }
+                    if result["state"] == "open" or (
+                        self.scan_type == "udp" and result["state"] == "open|filtered"
+                    ):
+                        with self.result_lock:
+                            self.results.append(result)
+                        self._print_result(result)
+                finally:
+                    work_queue.task_done()
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-            futures = {executor.submit(self.scan_port, port): port for port in self.ports}
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result["state"] == "open" or (self.scan_type == "udp" and result["state"] == "open|filtered"):
-                    self.results.append(result)
-                    self._print_result(result)
+            workers = [executor.submit(worker) for _ in range(self.threads)]
+            for port in self.ports:
+                work_queue.put(port)
+            for _ in workers:
+                work_queue.put(sentinel)
+            work_queue.join()
+            for future in workers:
+                future.result()
         self.results.sort(key=lambda item: item["port"])
         return self.results
 
@@ -6810,7 +6846,7 @@ def _cli_parser():
     parser.add_argument("-T", "--timing", choices=sorted(TIMING_PROFILES), default="T3", help="Port-scan timing profile")
     parser.add_argument("--scan-type", choices=("tcp", "syn", "udp"), default="tcp", help="Select TCP connect, SYN, or UDP probing")
     parser.add_argument("--timeout", type=float, default=None, help="Override connection timeout in seconds")
-    parser.add_argument("--threads", type=int, default=100, help="Port worker count (1-512)")
+    parser.add_argument("--threads", type=int, default=100, help="Port worker count (1-128)")
     parser.add_argument("--async-scan", action="store_true", help="Use the bounded asyncio TCP scanner")
     parser.add_argument("--async-concurrency", type=int, default=100, help="Async connections (1-512)")
     parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout (0-120 seconds)")
@@ -6936,8 +6972,8 @@ def main(argv: Optional[List[str]] = None):
             parser.error("--phone must be a phone number in a recognized format")
         if not 1 <= args.max_targets <= 65536:
             parser.error("--max-targets must be between 1 and 65536")
-        if not 1 <= args.threads <= 512:
-            parser.error("--threads must be between 1 and 512")
+        if not 1 <= args.threads <= 128:
+            parser.error("--threads must be between 1 and 128")
         if args.timeout is not None and (not math.isfinite(args.timeout) or not 0 < args.timeout <= 120):
             parser.error("--timeout must be greater than 0 and at most 120 seconds")
         if args.async_scan and args.scan_type != "tcp":
