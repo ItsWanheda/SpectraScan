@@ -6794,7 +6794,7 @@ def _udp_scan(target: str, ports: List[int], timeout: float) -> List[Dict]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         try:
-            sock.sendto(b"\\x00", (resolved, port))
+            sock.sendto(b"\x00", (resolved, port))
             try:
                 data, _ = sock.recvfrom(1024)
                 found.append({"port": port, "protocol": "udp", "state": "open",
