@@ -40,6 +40,8 @@ class BruteForcer:
             raise ValueError("port must be in the range 1..65535")
         if self.service not in {"ssh", "ftp"}:
             raise ValueError("service must be 'ssh' or 'ftp'")
+        if self.expected_host_fingerprint and not self.expected_host_fingerprint.startswith("SHA256:"):
+            raise ValueError("expected_host_fingerprint must use the OpenSSH SHA256: format")
         if isinstance(max_threads, bool) or not 1 <= int(max_threads) <= 32:
             raise ValueError("max_threads must be between 1 and 32")
         self.max_threads = int(max_threads)
