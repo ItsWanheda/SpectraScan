@@ -4296,7 +4296,9 @@ BOLD = "\033[1m"
 # ============== Report Manager ==============
 class ReportManager:
     def __init__(self):
-        self.report_dir = os.path.expanduser("~/.local/share/SpectraScan")
+        self.report_dir = os.path.abspath(os.path.expanduser(
+            os.environ.get("SPECTRASCAN_HOME", "~/.local/share/SpectraScan")
+        ))
         os.makedirs(self.report_dir, exist_ok=True)
         self.current_file = None
         self.append_file = False
@@ -4311,7 +4313,7 @@ class ReportManager:
         print(text)
 
     def read_report(self):
-        report_files = [f for f in os.listdir(self.report_dir) if f.startswith('SS-report')]
+        report_files = [f for f in os.listdir(self.report_dir) if f.startswith(('SS-report', 'SS-portscan'))]
         if not report_files:
             print(f"{RED}No reports found.{RESET}")
             return
@@ -6870,63 +6872,122 @@ def print_main_menu():
     console.print("[bold red]4.[/bold red] Exit")
  
  
-def main():
-    # Legacy CLI args for backward compatibility / scripting
-    if len(sys.argv) > 1:
-        parser = argparse.ArgumentParser(description="SpectraScan Legacy CLI")
-        parser.add_argument("-t", "--target", help="Target")
-        parser.add_argument("-d", "--domain", help="Domain")
-        parser.add_argument("-i", "--ip", help="IP")
-        parser.add_argument("--async-scan", action="store_true", help="Use the asyncio/aiohttp scanner engine for TCP scans")
-        parser.add_argument("--async-concurrency", type=int, default=100, help="Maximum concurrent async connections (default: 100)")
-        parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout in seconds (default: 1.0)")
-        args, _ = parser.parse_known_args()
-
-        if args.target:
-            try:
-                target = normalize_target(args.target)
-                resolved_ip = resolve_host(target)
-
-                if args.async_scan:
-                    scanner = AsyncPortScanner(target, ports=list(COMMON_PORTS.keys()), timeout=args.async_timeout, concurrency=args.async_concurrency)
-                    scanner.resolved_ip = resolved_ip
-                    asyncio.run(scanner.scan_async())
-                    result = scanner.get_results()
-                    console.print(f"[green][✓] Async scan completed in {result['duration']:.2f}s — {len(result['open_ports'])} open ports[/green]")
-                    for item in sorted(result["open_ports"], key=lambda value: value["port"]):
-                        console.print(f"[green][+] {item['port']}/tcp {item.get('service', 'unknown')} {item.get('banner', '')[:80]}[/green]")
-                else:
-                    scanner = PortScanner(target)
-                    scanner.resolved_ip = resolved_ip
-                    scanner.scan()
-                    scanner.print_summary()
-            except Exception as exc:
-                console.print(
-                    f"[!] Scan failed: {exc}",
-                    style="bold red",
-                )
-                sys.exit(1)
-
-            return
- 
-    print_banner()
-    
-    while True:
-        print_main_menu()
+def _udp_scan(target: str, ports: List[int], timeout: float) -> List[Dict]:
+    """Conservative UDP probe: only replies are marked open; silence is inconclusive."""
+    resolved = resolve_host(target)
+    found = []
+    for port in ports:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
         try:
-            choice = input(f"{CYAN}root@spectra:~#{RESET} Select Option: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
-            break
- 
-        if choice == "4":
-            console.print("[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
-            break
-        elif choice in MENU_ACTIONS:
-            MENU_ACTIONS[choice][1]()
+            sock.sendto(b"\\x00", (resolved, port))
+            try:
+                data, _ = sock.recvfrom(1024)
+                found.append({"port": port, "protocol": "udp", "state": "open",
+                              "service": COMMON_PORTS.get(port, "unknown"),
+                              "banner": data[:256].decode("utf-8", errors="replace")})
+            except socket.timeout:
+                continue
+        except OSError:
+            continue
+        finally:
+            sock.close()
+    return found
+
+
+def main():
+    parser = argparse.ArgumentParser(description="SpectraScan network scanner")
+    parser.add_argument("-t", "--target", help="Target hostname, IP, or URL")
+    parser.add_argument("-d", "--domain", help="Target domain (alias for --target)")
+    parser.add_argument("-i", "--ip", help="Target IP address (alias for --target)")
+    parser.add_argument("-p", "--ports", default="common", help="Ports: common, all, 80,443, or 1-1024")
+    parser.add_argument("--scan-type", choices=("tcp", "udp"), default="tcp",
+                        help="Scan protocol (default: tcp)")
+    parser.add_argument("--timing", choices=tuple(TIMING_PROFILES), default="T3")
+    parser.add_argument("--timeout", type=float, default=1.0)
+    parser.add_argument("--threads", type=int, default=100)
+    parser.add_argument("--output", help="Report output path")
+    parser.add_argument("--format", choices=("json", "html", "csv"),
+                        help="Report format; inferred from --output extension if omitted")
+    parser.add_argument("--async-scan", action="store_true",
+                        help="Use the asynchronous TCP scanner")
+    parser.add_argument("--async-concurrency", type=int, default=100)
+    parser.add_argument("--async-timeout", type=float, default=1.0)
+    args = parser.parse_args()
+
+    target = args.target or args.domain or args.ip
+    if not target:
+        if len(sys.argv) > 1:
+            parser.error("one of --target, --domain, or --ip is required")
+        print_banner()
+        while True:
+            print_main_menu()
+            try:
+                choice = input(f"{CYAN}root@spectra:~#{RESET} Select Option: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\\n[*] Exiting SpectraScan.", style="yellow")
+                break
+            if choice == "4":
+                console.print("[*] Exiting SpectraScan.", style="yellow")
+                break
+            elif choice in MENU_ACTIONS:
+                MENU_ACTIONS[choice][1]()
+            else:
+                console.print("[!] Invalid Option. Please try again.", style="red")
+        return
+
+    ports = parse_ports(args.ports)
+    if ports is None:
+        parser.error(f"invalid --ports value: {args.ports!r}")
+    if not 0 < args.timeout <= 60:
+        parser.error("--timeout must be between 0 and 60 seconds")
+    if not 1 <= args.threads <= 512:
+        parser.error("--threads must be between 1 and 512")
+    if not 1 <= args.async_concurrency <= 512:
+        parser.error("--async-concurrency must be between 1 and 512")
+    if not 0 < args.async_timeout <= 60:
+        parser.error("--async-timeout must be between 0 and 60 seconds")
+    if args.async_scan and args.scan_type != "tcp":
+        parser.error("--async-scan currently supports TCP only")
+
+    try:
+        target = normalize_target(target)
+        resolved_ip = resolve_host(target)
+        if args.scan_type == "udp":
+            if args.async_scan:
+                parser.error("UDP is not supported by --async-scan")
+            scanner = PortScanner(target, ports=ports, scan_type="udp", timeout=args.timeout,
+                                  threads=args.threads, timing=args.timing)
+            scanner.resolved_ip = resolved_ip
+            scanner.results = _udp_scan(target, ports, args.timeout)
+            scanner.start_time = time.time()
+            console.print(f"[green][+] UDP probe complete; {len(scanner.results)} responding ports[/green]")
+        elif args.async_scan:
+            scanner = AsyncPortScanner(target, ports=ports, timeout=args.async_timeout,
+                                       concurrency=args.async_concurrency)
+            scanner.resolved_ip = resolved_ip
+            asyncio.run(scanner.scan_async())
+            scanner.results = scanner.get_results()["open_ports"]
+            scanner.start_time = time.time() - scanner.get_results()["duration"]
+            console.print(f"[green][+] Async TCP scan complete; {len(scanner.results)} open ports[/green]")
         else:
-            console.print("[!] Invalid Option. Please try again.", style="red")
- 
- 
+            scanner = PortScanner(target, ports=ports, scan_type="tcp", timeout=args.timeout,
+                                  threads=args.threads, timing=args.timing)
+            scanner.resolved_ip = resolved_ip
+            scanner.scan()
+            scanner.print_summary()
+
+        if args.output:
+            report_format = args.format or os.path.splitext(args.output)[1].lower().lstrip(".")
+            if report_format not in {"json", "html", "csv"}:
+                parser.error("--format is required when --output has no .json, .html, or .csv extension")
+            os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+            {"json": scanner.export_json, "html": scanner.export_html,
+             "csv": scanner.export_csv}[report_format](args.output)
+    except (ValueError, OSError, socket.gaierror) as exc:
+        console.print(f"[!] Scan failed: {type(exc).__name__}: {exc}", style="bold red")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
