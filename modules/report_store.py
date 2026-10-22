@@ -65,11 +65,22 @@ class ReportStore:
         self.directory = Path(directory).expanduser().resolve() if directory else get_report_dir()
         self.directory.mkdir(parents=True, exist_ok=True)
 
+    def _safe_new_path(self, filename: str) -> Path:
+        candidate = Path(filename)
+        if candidate.name != filename or filename in {"", ".", ".."}:
+            raise ValueError("Report name must be a plain filename")
+        path = self.directory / filename
+        if path.is_symlink():
+            raise ValueError("Refusing to overwrite a symbolic link")
+        if path.resolve().parent != self.directory:
+            raise ValueError("Report path escapes the report directory")
+        return path
+
     def save_text(self, filename: str, content: str) -> str:
-        return atomic_write_text(self.directory / filename, content)
+        return atomic_write_text(self._safe_new_path(filename), content)
 
     def save_json(self, filename: str, data: Any) -> str:
-        return atomic_write_json(self.directory / filename, data)
+        return atomic_write_json(self._safe_new_path(filename), data)
 
     def list_reports(self) -> list[str]:
         return sorted(
