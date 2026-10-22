@@ -6877,6 +6877,32 @@ def main(argv: Optional[List[str]] = None):
     if argv:
         parser = _cli_parser()
         args = parser.parse_args(argv)
+
+        def option_was_provided(*names):
+            return any(token in argv for token in names)
+
+        port_options = (
+            option_was_provided("-p", "--ports", "-T", "--timing", "--timeout",
+                                "--async-scan", "--async-concurrency", "--async-timeout",
+                                "--scan-type", "--vuln-scan", "--os-detect", "--web-enum",
+                                "--max-targets", "--exclude")
+        )
+        non_port_target = any((args.domain, args.ip, args.email, args.phone, args.image))
+        module_target = any((args.smb, args.ldap, args.brute_force))
+        if non_port_target and port_options:
+            parser.error("port-scan options cannot be combined with domain, IP, email, phone, or image modes")
+        if module_target and port_options:
+            parser.error("port-scan options cannot be combined with SMB/LDAP/credential-validation modes")
+        if args.web_enum and not args.target:
+            parser.error("--web-enum requires -t/--target")
+        if args.web_enum and args.brute_force:
+            parser.error("--web-enum and --brute-force must run separately")
+        if args.vuln_scan and args.async_scan:
+            parser.error("--vuln-scan is not supported by --async-scan yet")
+        if args.vuln_scan and args.scan_type == "udp":
+            parser.error("--vuln-scan is not supported by UDP probes")
+        if args.wordlist and not (args.web_enum or args.brute_force):
+            parser.error("--wordlist requires --web-enum or --brute-force")
         if not any((args.target, args.domain, args.ip, args.email, args.phone, args.image)):
             parser.error("choose one target using -t/--target, -d/--domain, -i/--ip, -e/--email, --phone, or --image")
         if args.shodan and not args.ip:
@@ -7052,6 +7078,8 @@ def main(argv: Optional[List[str]] = None):
             "timing": "custom",
             "ports": ports, "decoys": [], "check_vulns": args.vuln_scan, "rate_limit": 0,
         }
+        if is_network and (args.web_enum or args.os_detect):
+            parser.error("--web-enum and --os-detect require a single host target, not a CIDR network")
         if is_network:
             if network.version != 4:
                 parser.error("CIDR port sweeps currently support IPv4 only; use a single IPv6 target")
