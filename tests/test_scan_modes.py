@@ -33,6 +33,19 @@ class TestScanModes(unittest.TestCase):
         self.assertEqual(result["protocol"], "tcp")
         self.assertEqual(result["state"], "closed")
 
+    def test_legacy_scanner_processes_ports_with_bounded_worker_pool(self):
+        scanner = SpectraScan.PortScanner(
+            "127.0.0.1", ports=list(range(1, 501)), timing="custom", threads=4
+        )
+        calls = []
+        def fake_probe(port):
+            calls.append(port)
+            return {"port": port, "protocol": "tcp", "state": "closed", "service": "unknown", "banner": "", "vulnerabilities": []}
+        with patch.object(scanner, "scan_port", side_effect=fake_probe):
+            results = scanner.scan()
+        self.assertEqual(len(calls), 500)
+        self.assertEqual(results, [])
+
     def test_syn_scan_does_not_silently_fall_back_to_tcp_connect(self):
         scanner = SpectraScan.SYNScan()
         scanner.is_admin = False
