@@ -6846,7 +6846,7 @@ def _cli_parser():
     parser.add_argument("-T", "--timing", choices=sorted(TIMING_PROFILES), default="T3", help="Port-scan timing profile")
     parser.add_argument("--scan-type", choices=("tcp", "syn", "udp"), default="tcp", help="Select TCP connect, SYN, or UDP probing")
     parser.add_argument("--timeout", type=float, default=None, help="Override connection timeout in seconds")
-    parser.add_argument("--threads", type=int, default=100, help="Port worker count (1-128)")
+    parser.add_argument("--threads", type=int, default=None, help="Override timing-profile port worker count (1-128)")
     parser.add_argument("--async-scan", action="store_true", help="Use the bounded asyncio TCP scanner")
     parser.add_argument("--async-concurrency", type=int, default=100, help="Async connections (1-512)")
     parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout (0-120 seconds)")
@@ -6943,8 +6943,8 @@ def main(argv: Optional[List[str]] = None):
             parser.error("choose one target using -t/--target, -d/--domain, -i/--ip, -e/--email, --phone, or --image")
         if args.shodan and not args.ip:
             parser.error("--shodan requires -i/--ip")
-        if args.links and not (args.domain or args.target):
-            parser.error("--links requires -d/--domain or -t/--target")
+        if args.links and not args.domain:
+            parser.error("--links requires -d/--domain")
         if args.dns_zone and not args.domain:
             parser.error("--dns-zone requires -d/--domain")
         if (args.smb or args.ldap or args.brute_force) and not args.target:
@@ -6972,7 +6972,7 @@ def main(argv: Optional[List[str]] = None):
             parser.error("--phone must be a phone number in a recognized format")
         if not 1 <= args.max_targets <= 65536:
             parser.error("--max-targets must be between 1 and 65536")
-        if not 1 <= args.threads <= 128:
+        if args.threads is not None and not 1 <= args.threads <= 128:
             parser.error("--threads must be between 1 and 128")
         if args.timeout is not None and (not math.isfinite(args.timeout) or not 0 < args.timeout <= 120):
             parser.error("--timeout must be greater than 0 and at most 120 seconds")
@@ -7061,7 +7061,7 @@ def main(argv: Optional[List[str]] = None):
             if args.brute_force:
                 brute = BruteForcer(
                     resolved_ip, args.port, args.service, args.wordlist,
-                    max_threads=min(args.threads, 32),
+                    max_threads=min(args.threads or 10, 32),
                     known_hosts_path=args.ssh_known_hosts,
                     expected_host_fingerprint=args.ssh_host_fingerprint,
                     max_passwords=args.max_attempts,
@@ -7109,7 +7109,7 @@ def main(argv: Optional[List[str]] = None):
 
         scan_kwargs = {
             "timeout": args.timeout if args.timeout is not None else TIMING_PROFILES[args.timing]["timeout"],
-            "threads": args.threads,
+            "threads": args.threads if args.threads is not None else TIMING_PROFILES[args.timing]["threads"],
             "scan_type": args.scan_type,
             "timing": "custom",
             "ports": ports, "decoys": [], "check_vulns": args.vuln_scan, "rate_limit": 0,
