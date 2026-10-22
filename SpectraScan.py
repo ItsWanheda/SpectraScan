@@ -14,6 +14,9 @@ import random
 import struct
 import os
 import logging
+import math
+import queue
+import threading
 import ssl
 import subprocess
 import re
@@ -37,6 +40,14 @@ from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from modules.async_scanner import AsyncPortScanner
+from modules.report_store import ReportStore, atomic_write_text, atomic_write_json, safe_csv_cell
+from modules.web_enumerator import WebEnumerator
+from modules.brute_forcer import BruteForcer
+from modules.vuln_scanner import VulnScanner
+from modules.smb_enum import SMBEnumerator
+from modules.ldap_enum import LDAPEnumerator
+from modules.dns_zone import DNSZone
+import io
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "modules"))
 
@@ -3056,19 +3067,7 @@ def save_json_report(
             exist_ok=True,
         )
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            report,
-            file,
-            indent=2,
-            ensure_ascii=False,
-            default=str,
-        )
-
+    atomic_write_text(output_path, json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n")
     return output_path
 
 
@@ -4295,65 +4294,61 @@ BOLD = "\033[1m"
 
 # ============== Report Manager ==============
 class ReportManager:
+    """Console report manager backed by the shared atomic report store."""
     def __init__(self):
-        self.report_dir = os.path.expanduser("~/.local/share/SpectraScan")
-        os.makedirs(self.report_dir, exist_ok=True)
+        self.store = ReportStore()
+        self.report_dir = str(self.store.directory)
         self.current_file = None
         self.append_file = False
+        self._buffer: List[str] = []
 
     def save_output(self):
-        # In CLI mode, we might skip auto-prompting if not explicitly asked, 
-        # but we keep the logic for consistency.
-        pass 
+        if not self._buffer:
+            console.print("[yellow]No report output to save.[/yellow]")
+            return None
+        filename = f"SS-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        path = self.store.save_text(filename, "\n".join(self._buffer) + "\n")
+        console.print(f"[green][+] Report saved: {path}[/green]")
+        return path
 
     def write(self, text):
-        # In CLI mode, we can just print to console directly
-        print(text)
+        value = str(text)
+        self._buffer.append(value)
+        console.print(value, markup=False)
 
     def read_report(self):
-        report_files = [f for f in os.listdir(self.report_dir) if f.startswith('SS-report')]
-        if not report_files:
-            print(f"{RED}No reports found.{RESET}")
+        reports = self.store.list_reports()
+        if not reports:
+            console.print("[yellow]No reports found.[/yellow]")
             return
-        print(f"\n{CYAN}[-] Files in {self.report_dir}:{RESET}")
-        for i, f in enumerate(report_files):
-            print(f"{GREEN}[{i+1}]{RESET} {f}")
-
+        for index, filename in enumerate(reports, 1):
+            console.print(f"{index}. {filename}")
         try:
-            target_num = int(input(f"{CYAN}Enter number to read: {RESET}"))
-            if 1 <= target_num <= len(report_files):
-                file_path = os.path.join(self.report_dir, report_files[target_num-1])
-                print(f"\n{BOLD}{RED}{file_path}{RESET}\n")
-                with open(file_path, 'r') as f:
-                    print(f.read())
-            else:
-                print(f"{RED}Invalid input.{RESET}")
-        except ValueError:
-            print(f"{RED}Invalid input.{RESET}")
+            selection = int(input("Select report number: ").strip())
+            if not 1 <= selection <= len(reports):
+                raise ValueError
+            console.print(self.store.read_text(reports[selection - 1]), markup=False)
+        except (ValueError, OSError, UnicodeError):
+            console.print("[red]Invalid selection or report could not be read.[/red]")
 
     def delete_report(self):
-        report_files = [f for f in os.listdir(self.report_dir) if f.startswith('SS-report')]
-        if not report_files:
-            print(f"{RED}No reports found.{RESET}")
+        reports = self.store.list_reports()
+        if not reports:
+            console.print("[yellow]No reports found.[/yellow]")
             return
-        print(f"\n{CYAN}[-] Files in {self.report_dir}:{RESET}")
-        for i, f in enumerate(report_files):
-            print(f"{GREEN}[{i+1}]{RESET} {f}")
-
+        for index, filename in enumerate(reports, 1):
+            console.print(f"{index}. {filename}")
         try:
-            target_num = int(input(f"{CYAN}Enter number to delete: {RESET}"))
-            if 1 <= target_num <= len(report_files):
-                file_path = os.path.join(self.report_dir, report_files[target_num-1])
-                confirm = input(f"{RED}Delete {file_path}? (y/N): {RESET}").lower()
-                if confirm == 'y':
-                    os.remove(file_path)
-                    print(f"{GREEN}[+] Deleted.{RESET}")
-                else:
-                    print(f"{YELLOW}Cancelled.{RESET}")
-            else:
-                print(f"{RED}Invalid input.{RESET}")
-        except ValueError:
-            print(f"{RED}Invalid input.{RESET}")
+            selection = int(input("Select report number to delete: ").strip())
+            if not 1 <= selection <= len(reports):
+                raise ValueError
+            filename = reports[selection - 1]
+            if Confirm.ask(f"Delete {filename}?", default=False):
+                self.store.delete(filename)
+                console.print("[green][+] Deleted.[/green]")
+        except (ValueError, OSError):
+            console.print("[red]Invalid selection or report could not be deleted.[/red]")
+
 
 # ============== Utility Functions ==============
 def normalize_target(target: str) -> str:
@@ -4397,19 +4392,21 @@ def normalize_target(target: str) -> str:
 
 
 def resolve_host(hostname: str) -> str:
-    """Resolve a single host/IP. CIDR networks are handled separately."""
+    """Resolve a single host or IP. CIDR networks must use the network-scan path."""
     target = normalize_target(hostname)
-
     if not target:
         raise ValueError("Target cannot be empty")
-
     try:
-        network = ipaddress.ip_network(target, strict=False)
-        raise ValueError(f"CIDR network detected: {network}")
-    except ValueError as exc:
-        if "CIDR network detected" in str(exc):
-            raise
-
+        return str(ipaddress.ip_address(target))
+    except ValueError:
+        pass
+    if "/" in target:
+        try:
+            network = ipaddress.ip_network(target, strict=False)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"CIDR network detected: {network}")
     try:
         return socket.gethostbyname(target)
     except socket.gaierror as exc:
@@ -4523,72 +4520,60 @@ class RateLimiter:
 
 # ============== SYN Scanner ==============
 class SYNScan:
-    __slots__ = ("is_admin",)
-    
     def __init__(self):
         self.is_admin = os.geteuid() == 0 if hasattr(os, "geteuid") else False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                self.is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                self.is_admin = False
 
     def create_packet(self, src_ip: str, dst_ip: str, dst_port: int) -> bytes:
         ip_header = struct.pack(
-            "!BBHHHBBH4s4s",
-            0x45,
-            0,
-            40,
-            random.randint(1, 65535),
-            0,
-            64,
-            6,
-            0,
-            socket.inet_aton(src_ip),
-            socket.inet_aton(dst_ip),
+            "!BBHHHBBH4s4s", 0x45, 0, 40, random.randint(1, 65535),
+            0, 64, 6, 0, socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
         )
         tcp_header = struct.pack(
-            "!HHLLBBHHH",
-            random.randint(1024, 65535),
-            dst_port,
-            random.randint(0, 4294967295),
-            0,
-            0x50,
-            0x02,
-            65535,
-            0,
-            0,
+            "!HHLLBBHHH", random.randint(1024, 65535), dst_port,
+            random.randint(0, 4294967295), 0, 0x50, 0x02, 65535, 0, 0,
         )
         return ip_header + tcp_header
 
     def scan(self, target_ip: str, port: int, timeout: float = 2.0) -> str:
-        # Fall back to TCP connect scan if we don't have raw socket privileges
+        """Perform a real half-open SYN probe; never silently fall back to TCP connect."""
         if not self.is_admin:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                rc = sock.connect_ex((target_ip, port))
-                sock.close()
-                if rc == 0:
-                    return "open"
-                elif rc in (111, 10061):  # ECONNREFUSED
-                    return "closed"
-                else:
-                    return "filtered"
-            except socket.timeout:
-                return "filtered"
-            except:
-                return "error"
+            return "error"
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-            sock.settimeout(timeout)
-            packet = self.create_packet(get_local_ip(), target_ip, port)
-            sock.sendto(packet, (target_ip, 0))
-            data, _ = sock.recvfrom(1024)
-            sock.close()
-            tcp_flags = data[20 + 13]
-            if tcp_flags & 0x12:
+            from scapy.all import IP, TCP, RandShort, sr1, send
+            source_port = int(RandShort())
+            probe = IP(dst=target_ip) / TCP(sport=source_port, dport=port, flags="S")
+            reply = sr1(probe, timeout=timeout, verbose=0)
+            if reply is None:
+                return "filtered"
+            if not reply.haslayer(TCP):
+                return "filtered"
+            flags = int(reply[TCP].flags)
+            if flags & 0x12 == 0x12:
+                # Reset the half-open connection after observing a SYN-ACK.
+                try:
+                    reset = IP(dst=target_ip) / TCP(
+                        sport=source_port, dport=port, flags="R", seq=int(reply[TCP].ack)
+                    )
+                    send(reset, verbose=0)
+                except Exception:
+                    pass
                 return "open"
-            elif tcp_flags & 0x14 or tcp_flags & 0x04:
+            if flags & 0x04 or flags & 0x14:
                 return "closed"
             return "filtered"
-        except:
+        except ImportError:
+            return "error"
+        except PermissionError:
+            return "error"
+        except OSError:
+            return "error"
+        except Exception:
             return "error"
 
 # ============== UDP Scanner ==============
@@ -4961,13 +4946,30 @@ class PingSweep:
                 except:
                     pass
                 return {"ip": str(ip), "alive": False}
+            if net.num_addresses > 4096:
+                raise ValueError(f"Network contains {net.num_addresses} addresses; the ping-sweep hard limit is 4096.")
+            if net.num_addresses > 256 and not Confirm.ask(f"Scan {net.num_addresses} addresses?", default=False):
+                print(f"{YELLOW}[*] Ping sweep cancelled.{RESET}")
+                return hosts
             with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-                futures = [executor.submit(ping_host, ip) for ip in net.hosts()]
-                for future in concurrent.futures.as_completed(futures):
-                    res = future.result()
-                    if res["alive"]:
-                        hosts.append(res)
-                        print(f"{GREEN}[+] Host found: {res['ip']}{RESET}")
+                iterator = iter(net.hosts())
+                pending = set()
+                for _ in range(min(100, net.num_addresses)):
+                    try:
+                        pending.add(executor.submit(ping_host, next(iterator)))
+                    except StopIteration:
+                        break
+                while pending:
+                    done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for future in done:
+                        res = future.result()
+                        if res["alive"]:
+                            hosts.append(res)
+                            print(f"{GREEN}[+] Host found: {res['ip']}{RESET}")
+                        try:
+                            pending.add(executor.submit(ping_host, next(iterator)))
+                        except StopIteration:
+                            pass
         except Exception as e:
             print(f"{RED}[-] Error: {e}{RESET}")
         return hosts
@@ -4978,31 +4980,33 @@ class ARPScanner:
     def scan(network: str) -> List[Dict]:
         hosts = []
         try:
-            # Determine the network prefix (e.g., "192.168.1.") for membership testing
             try:
-                net = ipaddress.ip_network(network, strict=False)
-                net_hosts = {str(ip) for ip in net.hosts()}
+                network_obj = ipaddress.ip_network(network, strict=False)
             except ValueError:
-                net_hosts = None
+                network_obj = None
 
             cmd = ["arp", "-a"] if sys.platform == "win32" else ["arp", "-a", "-n"]
-            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode()
-            for line in output.split("\n"):
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode(errors="replace")
+            for line in output.splitlines():
                 match = re.search(
                     r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-f:-]+)\s+(\w+)",
                     line,
                     re.IGNORECASE,
                 )
-                if match:
-                    ip, mac, iface = match.groups()
-                    if net_hosts is None:
-                        if ip.startswith(".".join(network.split(".")[:3]) + "."):
-                            hosts.append({"ip": ip, "mac": mac, "interface": iface})
-                    else:
-                        if ip in net_hosts:
-                            hosts.append({"ip": ip, "mac": mac, "interface": iface})
-        except Exception as e:
-            print(f"{RED}[-] ARP scan error: {e}{RESET}")
+                if not match:
+                    continue
+                ip, mac, iface = match.groups()
+                if network_obj is not None:
+                    try:
+                        if ipaddress.ip_address(ip) not in network_obj:
+                            continue
+                    except ValueError:
+                        continue
+                elif not ip.startswith(".".join(network.split(".")[:3]) + "."):
+                    continue
+                hosts.append({"ip": ip, "mac": mac, "interface": iface})
+        except Exception as exc:
+            print(f"{RED}[-] ARP scan error: {type(exc).__name__}{RESET}")
         return hosts
 
 # ============== Traceroute ==============
@@ -5044,6 +5048,7 @@ class PortScanner:
         "vulnerabilities",
         "start_time",
         "rate_limiter",
+        "result_lock",
     )
     
     def __init__(self, target: str, **kwargs):
@@ -5061,10 +5066,13 @@ class PortScanner:
         self.vulnerabilities = []
         self.start_time = None
         self.rate_limiter = RateLimiter(self.rate_limit) if self.rate_limit else None
+        self.result_lock = threading.Lock()
         if self.timing in TIMING_PROFILES:
             profile = TIMING_PROFILES[self.timing]
             self.threads = profile["threads"]
             self.timeout = profile["timeout"]
+        # Keep total worker creation bounded even under the most aggressive profile.
+        self.threads = max(1, min(int(self.threads), 128))
 
     def initialize(self):
         print(f"\n{BOLD}{CYAN}{'='*60}")
@@ -5087,56 +5095,103 @@ class PortScanner:
     def scan_port(self, port: int) -> Dict:
         if self.rate_limiter:
             self.rate_limiter.wait()
+        service_value = COMMON_PORTS.get(port, "unknown")
+        if self.scan_type == "udp":
+            udp_result = UDPScan().scan(self.resolved_ip, port, timeout=self.timeout)
+            service = udp_result.get("service", (service_value, ""))
+            if isinstance(service, tuple):
+                service = service[0] if service else "unknown"
+            return {
+                "port": port, "protocol": "udp", "state": udp_result.get("state", "error"),
+                "service": service, "description": PORT_DESCRIPTIONS.get(port, ""),
+                "banner": "", "response": udp_result.get("response", ""),
+                "error": udp_result.get("error"), "version_info": {"type": "unknown", "version": "unknown"},
+                "vulnerabilities": [],
+            }
+        if self.scan_type == "syn":
+            state = SYNScan().scan(self.resolved_ip, port, timeout=self.timeout)
+            result = {
+                "port": port, "protocol": "tcp", "state": state, "service": service_value,
+                "description": PORT_DESCRIPTIONS.get(port, ""), "banner": "",
+                "version_info": {"type": "unknown", "version": "unknown"}, "vulnerabilities": [],
+            }
+            if state == "open":
+                result["banner"] = grab_banner(self.resolved_ip, port, self.timeout)
+                result["version_info"] = identify_service(result["banner"])
+                if self.check_vulns:
+                    result["vulnerabilities"] = check_vulnerabilities(port, service_value, result["banner"])
+                    with self.result_lock:
+                        self.vulnerabilities.extend(result["vulnerabilities"])
+            return result
         result = {
-            "port": port,
-            "protocol": "tcp",
-            "state": "closed",
-            "service": COMMON_PORTS.get(port, "unknown"),
-            "description": PORT_DESCRIPTIONS.get(port, ""),
-            "banner": "",
-            "version_info": {"type": "unknown", "version": "unknown"},
+            "port": port, "protocol": "tcp", "state": "closed",
+            "service": service_value, "description": PORT_DESCRIPTIONS.get(port, ""),
+            "banner": "", "version_info": {"type": "unknown", "version": "unknown"},
             "vulnerabilities": [],
         }
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
-            if self.decoys:
-                decoy = random.choice(self.decoys)
-                try:
-                    sock.bind((decoy, 0))
-                except:
-                    pass
             if sock.connect_ex((self.resolved_ip, port)) == 0:
                 result["state"] = "open"
-                banner = grab_banner(self.resolved_ip, port, self.timeout)
-                result["banner"] = banner
-                result["version_info"] = identify_service(banner)
+                result["banner"] = grab_banner(self.resolved_ip, port, self.timeout)
+                result["version_info"] = identify_service(result["banner"])
                 if self.check_vulns:
-                    vulns = check_vulnerabilities(port, result["service"], banner)
-                    if vulns:
-                        result["vulnerabilities"] = vulns
-                        self.vulnerabilities.extend(vulns)
-            sock.close()
+                    result["vulnerabilities"] = check_vulnerabilities(port, result["service"], result["banner"])
+                    self.vulnerabilities.extend(result["vulnerabilities"])
         except socket.timeout:
             result["state"] = "filtered"
-        except socket.error:
+        except OSError as exc:
             result["state"] = "error"
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            if sock is not None:
+                sock.close()
         return result
 
     def scan(self) -> List[Dict]:
+        """Scan ports with a bounded queue; submit only one worker task per thread."""
         self.start_time = time.time()
+        self.results = []
+        self.vulnerabilities = []
         print(f"{CYAN}[*] Spectra is scanning...\n")
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.threads
-        ) as executor:
-            futures = {
-                executor.submit(self.scan_port, port): port for port in self.ports
-            }
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result["state"] == "open":
-                    self.results.append(result)
-                    self._print_result(result)
+        sentinel = object()
+        work_queue = queue.Queue(maxsize=max(2, self.threads * 2))
+
+        def worker():
+            while True:
+                port = work_queue.get()
+                try:
+                    if port is sentinel:
+                        return
+                    try:
+                        result = self.scan_port(port)
+                    except Exception as exc:
+                        result = {
+                            "port": port, "protocol": "udp" if self.scan_type == "udp" else "tcp",
+                            "state": "error", "service": COMMON_PORTS.get(port, "unknown"),
+                            "banner": "", "error": type(exc).__name__, "vulnerabilities": [],
+                        }
+                    if result["state"] == "open" or (
+                        self.scan_type == "udp" and result["state"] == "open|filtered"
+                    ):
+                        with self.result_lock:
+                            self.results.append(result)
+                        self._print_result(result)
+                finally:
+                    work_queue.task_done()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            workers = [executor.submit(worker) for _ in range(self.threads)]
+            for port in self.ports:
+                work_queue.put(port)
+            for _ in workers:
+                work_queue.put(sentinel)
+            work_queue.join()
+            for future in workers:
+                future.result()
+        self.results.sort(key=lambda item: item["port"])
         return self.results
 
     def _print_result(self, result: Dict):
@@ -5206,9 +5261,8 @@ class PortScanner:
         }
 
     def export_json(self, filename: str):
-        with open(filename, "w") as f:
-            json.dump(self.get_results(), f, indent=2, default=str)
-        print(f"{GREEN}[+] JSON report saved: {filename}")
+        path = atomic_write_json(filename, self.get_results())
+        print(f"{GREEN}[+] JSON report saved: {path}")
 
     def export_html(self, filename: str):
         results = self.get_results()
@@ -5217,122 +5271,59 @@ class PortScanner:
         resolved_ip = html.escape(str(results.get("resolved_ip", "") or ""))
         timestamp = html.escape(str(results.get("timestamp", "")))
         duration = f"{results.get('duration', 0):.2f}"
-
         parts = [f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>SpectraScan Report - {target}</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-        h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
-        .summary {{ background: #e9ecef; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-        th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background: #007bff; color: white; }}
-        tr:hover {{ background: #f1f1f1; }}
-        .open {{ color: #28a745; font-weight: bold; }}
-        .closed {{ color: #dc3545; }}
-        .filtered {{ color: #ffc107; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>SpectraScan Report</h1>
-        <div class="summary">
-            <p><strong>Target:</strong> {target}</p>
-            <p><strong>Resolved IP:</strong> {resolved_ip}</p>
-            <p><strong>Scan Type:</strong> {scan_type}</p>
-            <p><strong>Timestamp:</strong> {timestamp}</p>
-            <p><strong>Duration:</strong> {duration}s</p>
-            <p><strong>Open Ports:</strong> {len(results.get('open_ports', []))}</p>
-            <p><strong>Vulnerabilities:</strong> {len(results.get('vulnerabilities', []))}</p>
-        </div>
-        <h2>Open Ports</h2>
-        <table>
-            <tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr>"""]
-
+<html><head><meta charset="utf-8"><title>SpectraScan Report - {target}</title>
+<style>body{{font-family:Arial,sans-serif;margin:20px}}table{{width:100%;border-collapse:collapse}}td,th{{padding:8px;border-bottom:1px solid #ddd}}th{{background:#222;color:#fff}}</style>
+</head><body><h1>SpectraScan Report</h1>
+<p><b>Target:</b> {target}</p><p><b>Resolved IP:</b> {resolved_ip}</p>
+<p><b>Scan type:</b> {scan_type}</p><p><b>Timestamp:</b> {timestamp}</p>
+<p><b>Duration:</b> {duration}s</p>
+<h2>Open / responsive ports</h2><table><tr><th>Port</th><th>Protocol</th><th>State</th><th>Service</th><th>Banner</th></tr>"""]
         for port in results.get("open_ports", []):
-            port_num = html.escape(str(port.get("port", "")))
-            service = port.get("service", "")
+            service = port.get("service", "unknown")
             if isinstance(service, tuple):
-                service = service if service else ""
-            service = html.escape(str(service))
-            state = html.escape(str(port.get("state", "")))
-            banner = html.escape((port.get("banner", "") or "N/A")[:50])
-            parts.append(
-                f"<tr><td>{port_num}</td><td>{service}</td>"
-                f"<td class='open'>{state}</td><td>{banner}</td></tr>"
-            )
-
-        parts.append("""        </table>
-    </div>
-</body>
-</html>""")
-
-        with open(filename, "w") as f:
-            f.write("".join(parts))
-        print(f"{GREEN}[+] HTML report saved: {filename}")
+                service = " ".join(str(part) for part in service if part)
+            cells = [port.get("port", ""), port.get("protocol", "tcp"), port.get("state", ""), service, (port.get("banner", "") or "")[:300]]
+            parts.append("<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in cells) + "</tr>")
+        parts.append("</table></body></html>")
+        path = atomic_write_text(filename, "".join(parts))
+        print(f"{GREEN}[+] HTML report saved: {path}")
 
     def export_csv(self, filename: str):
-        with open(filename, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["Port", "Protocol", "State", "Service", "Banner", "Vulnerabilities"]
-            )
-            for port in self.results:
-                service = port.get("service", "")
-                if isinstance(service, tuple):
-                    service = service if service else ""
-                banner = port.get("banner", "") or "None"
-                vulns = (
-                    "; ".join(
-                        [v["vulnerability"] for v in port.get("vulnerabilities", [])]
-                    )
-                    or "None"
-                )
-                writer.writerow(
-                    [
-                        port["port"],
-                        "tcp",
-                        port["state"],
-                        service,
-                        banner[:50],
-                        vulns,
-                    ]
-                )
-        print(f"{GREEN}[+] CSV report saved: {filename}")
+        stream = io.StringIO(newline="")
+        writer = csv.writer(stream)
+        writer.writerow(["Port", "Protocol", "State", "Service", "Banner", "Vulnerabilities"])
+        for port in self.results:
+            service = port.get("service", "")
+            if isinstance(service, tuple):
+                service = " ".join(str(part) for part in service if part)
+            vulns = "; ".join(str(v.get("vulnerability", "")) for v in port.get("vulnerabilities", [])) or "None"
+            writer.writerow([
+                safe_csv_cell(port.get("port", "")), safe_csv_cell(port.get("protocol", "tcp")),
+                safe_csv_cell(port.get("state", "")), safe_csv_cell(service),
+                safe_csv_cell((port.get("banner", "") or "")[:500]), safe_csv_cell(vulns),
+            ])
+        path = atomic_write_text(filename, stream.getvalue())
+        print(f"{GREEN}[+] CSV report saved: {path}")
 
 # ============== Network Scanner ==============
 class NetworkScanner:
     @staticmethod
     def scan_network(network: str, ports: List[int] = None, **kwargs) -> List[Dict]:
-        try:
-            net = ipaddress.ip_network(network, strict=False)
-            print(f"{CYAN}[*] Spectra is Scanning network: {network}")
-            print(f"[*] Hosts: {net.num_addresses - 2}")
-            results = []
-            for ip in net.hosts():
-                ip_str = str(ip)
-                scanner = PortScanner(
-                    ip_str, ports=ports or list(COMMON_PORTS.keys()), **kwargs
-                )
-                scanner.resolved_ip = ip_str
-                scanner.scan()
-                if scanner.results:
-                    results.append(
-                        {
-                            "ip": ip_str,
-                            "hostname": reverse_dns(ip_str),
-                            "ports": scanner.results,
-                        }
-                    )
-                    print(f"{GREEN}[+] {ip_str}: {len(scanner.results)} open ports")
-            return results
-        except ValueError as e:
-            print(f"{RED}[-] Invalid network: {e}")
-            return []
+        max_targets = int(kwargs.pop("max_targets", 1024))
+        exclusions = kwargs.pop("exclusions", None)
+        host_workers = int(kwargs.pop("host_workers", 4))
+        confirmed = bool(kwargs.pop("large_scan_confirmed", False))
+        rows = run_network_port_scan(
+            network, {"ports": ports or list(COMMON_PORTS.keys()), **kwargs},
+            exclusions=exclusions, max_targets=max_targets,
+            host_workers=host_workers, large_scan_confirmed=confirmed,
+        )
+        return [
+            {"ip": row["ip"], "hostname": reverse_dns(row["ip"]), "ports": row["ports"]}
+            for row in rows
+        ]
+
 
 # ============== Protocol Module Scanner ==============
 class ProtocolModuleScanner:
@@ -6062,7 +6053,7 @@ class DomainScanner:
     def _infrastructure(cls, dns_data):
         ips = dns_data.get("resolved_ips", [])
         result = {"ips": ips, "reverse_dns": cls._reverse_dns(ips)}
-        api_key = os.environ.get("SHODAN_API_KEY")
+        api_key = os.environ.get("SHODAN_API_KEY") or os.environ.get("SHODAN_KEY")
         if api_key and ips:
             try:
                 import requests
@@ -6216,7 +6207,7 @@ class DomainScanner:
 class IPScanner:
     """Integrates SpectraScan IP Scanner features"""
     @staticmethod
-    def scan(ip: str, report_manager: ReportManager):
+    def scan(ip: str, report_manager: ReportManager, include_shodan: Optional[bool] = None):
         report_manager.write(f"\n-----IP SCAN OF {ip}-----\n")
 
         # GeoIP
@@ -6238,29 +6229,33 @@ class IPScanner:
         report_manager.write("\n[*] ADMIN INFO (WHOIS)")
         report_manager.write(DomainScanner._run_whois(ip))
 
-        # Shodan
-        report_manager.write("\n[*] SHODAN RESULTS")
-        api_key = os.environ.get("SHODAN_API_KEY")
-        if not api_key:
-            report_manager.write("[-] SHODAN_API_KEY environment variable not set. Skipping Shodan lookup.")
+        # Shodan: optional in one-shot CLI mode, legacy auto mode in interactive menu.
+        if include_shodan is False:
+            report_manager.write("\n[*] SHODAN RESULTS")
+            report_manager.write("[*] Shodan lookup disabled. Pass --shodan to request enrichment.")
         else:
-            try:
-                import shodan
-                api = shodan.Shodan(api_key)
-                result = api.host(ip)
-                ports = result.get("ports", [])
-                report_manager.write(f"Open Ports: {len(ports)}")
-                for port in ports:
-                    banner = ""
-                    for entry in result.get("data", []):
-                        if entry.get("port") == port:
-                            banner = entry.get("product", "Unknown")
-                            break
-                    report_manager.write(f"  Port {port}: {banner}")
-            except ImportError:
-                report_manager.write("[-] Shodan Python library not found. Install with: pip install shodan")
-            except Exception as e:
-                report_manager.write(f"Error with Shodan: {e}")
+            report_manager.write("\n[*] SHODAN RESULTS")
+            api_key = os.environ.get("SHODAN_API_KEY")
+            if not api_key:
+                report_manager.write("[-] SHODAN_API_KEY environment variable not set. Skipping Shodan lookup.")
+            else:
+                try:
+                    import shodan
+                    api = shodan.Shodan(api_key)
+                    result = api.host(ip)
+                    ports = result.get("ports", [])
+                    report_manager.write(f"Open Ports: {len(ports)}")
+                    for port in ports:
+                        banner = ""
+                        for entry in result.get("data", []):
+                            if entry.get("port") == port:
+                                banner = entry.get("product", "Unknown")
+                                break
+                        report_manager.write(f"  Port {port}: {banner}")
+                except ImportError:
+                    report_manager.write("[-] Shodan Python library not found. Install with: pip install shodan")
+                except Exception as e:
+                    report_manager.write(f"Error with Shodan: {type(e).__name__}")
 
         report_manager.write("\n[*] DONE")
 
@@ -6275,11 +6270,11 @@ class PhoneScanner:
         report_manager.write("-------------------------------------------------------------------------------")
 
         # Uses the external python script from the original codebase
-        script_path = os.path.join(os.path.dirname(__file__), "modules", "phone_scanner.py")
+        script_path = os.path.join(os.path.dirname(__file__), "modules", "phone_locator.py")
         if os.path.exists(script_path):
             try:
                 result = subprocess.run(
-                    ["python3", script_path, phone],
+                    [sys.executable, script_path, phone],
                     capture_output=True,
                     text=True,
                     timeout=60,
@@ -6474,131 +6469,93 @@ def parse_ports(ports_input: str):
  
  
 def run_network_port_scan(
-    network_target: str,
-    scan_kwargs: dict,
+    network_target: str, scan_kwargs: dict, exclusions=None,
+    max_targets: int = 1024, host_workers: int = 4,
+    large_scan_confirmed: bool = False,
 ):
-    """Scan each usable host in a CIDR network."""
-
+    """Scan a bounded CIDR using a producer thread and fixed worker pool."""
     try:
-        network = ipaddress.ip_network(
-            network_target,
-            strict=False,
-        )
+        network = ipaddress.ip_network(network_target, strict=False)
     except ValueError as exc:
-        console.print(
-            f"[!] Invalid network: {exc}",
-            style="bold red",
-        )
-        return []
-
-    hosts = list(network.hosts())
-
-    if not hosts:
-        console.print(
-            "[!] No usable hosts found.",
-            style="bold red",
-        )
-        return []
-
-    if len(hosts) > 256:
-        proceed = Confirm.ask(
-            f"[!] Network contains {len(hosts)} hosts. Continue?",
-            default=False,
-        )
-        if not proceed:
-            console.print(
-                "[*] Network scan cancelled.",
-                style="yellow",
-            )
-            return []
-
-    console.print(
-        "\n[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-    console.print(
-        f"[bold green][+] Network Scan: {network}[/bold green]"
-    )
-    console.print(
-        f"[cyan][*] Hosts: {len(hosts)}[/cyan]"
-    )
-    console.print(
-        "[bold cyan]"
-        "============================================================"
-        "[/bold cyan]\n"
-    )
-
-    all_results = []
-
-    for index, host in enumerate(hosts, start=1):
-        host_ip = str(host)
-
-        console.print(
-            f"\n[bold yellow]"
-            f"[{index}/{len(hosts)}] Scanning {host_ip}"
-            f"[/bold yellow]"
-        )
-
+        raise ValueError(f"Invalid network: {exc}") from exc
+    if isinstance(max_targets, bool) or not 1 <= int(max_targets) <= 65536:
+        raise ValueError("max_targets must be between 1 and 65536")
+    if isinstance(host_workers, bool) or not 1 <= int(host_workers) <= 16:
+        raise ValueError("host_workers must be between 1 and 16")
+    if network.num_addresses > int(max_targets):
+        raise ValueError(f"Network contains {network.num_addresses} addresses; configured maximum is {max_targets}.")
+    if network.num_addresses > 64 and not large_scan_confirmed:
+        raise ValueError("Large network scan requires explicit confirmation (--yes).")
+    excluded_networks = []
+    for value in exclusions or []:
         try:
-            resolved_ip = resolve_host(host_ip)
+            excluded_networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"Invalid exclusion network: {value}") from exc
+    for excluded in excluded_networks:
+        if excluded.version != network.version:
+            raise ValueError(f"Exclusion {excluded} uses a different IP version from {network}.")
+    # Avoid multiplying host workers by a full-size port pool per host.
+    bounded_scan_kwargs = dict(scan_kwargs)
+    bounded_scan_kwargs["threads"] = min(
+        max(1, int(bounded_scan_kwargs.get("threads", 100))),
+        max(1, 128 // int(host_workers)),
+    )
+    work_queue = queue.Queue(maxsize=max(2, host_workers * 2))
+    sentinel = object()
+    results = []
+    errors = []
+    result_lock = threading.Lock()
 
-            scanner = PortScanner(
-                host_ip,
-                **scan_kwargs,
-            )
-
-            scanner.resolved_ip = resolved_ip
-            scanner.scan()
-
-            result = scanner.get_results()
-
-            if isinstance(result, dict):
-                all_results.append(result)
-
-            scanner.print_summary()
-
-        except KeyboardInterrupt:
-            console.print(
-                "\n[!] Network scan interrupted.",
-                style="yellow",
-            )
-            break
-
+    def producer():
+        try:
+            for address in network.hosts():
+                if any(address in excluded for excluded in excluded_networks):
+                    continue
+                work_queue.put(str(address))
         except Exception as exc:
-            console.print(
-                f"[!] {host_ip}: {exc}",
-                style="red",
-            )
+            errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            for _ in range(host_workers):
+                work_queue.put(sentinel)
 
-    total_open = sum(
-        len(result.get("open_ports", []))
-        for result in all_results
-        if isinstance(result, dict)
-    )
+    def worker():
+        while True:
+            item = work_queue.get()
+            try:
+                if item is sentinel:
+                    return
+                ip_text = str(item)
+                try:
+                    scanner = PortScanner(ip_text, **bounded_scan_kwargs)
+                    scanner.resolved_ip = ip_text
+                    scanner.scan()
+                    if scanner.results:
+                        with result_lock:
+                            results.append({"ip": ip_text, "ports": scanner.results})
+                        print(f"{GREEN}[+] {ip_text}: {len(scanner.results)} responsive ports")
+                except Exception as exc:
+                    with result_lock:
+                        errors.append(f"{ip_text}: {type(exc).__name__}")
+            finally:
+                work_queue.task_done()
 
-    console.print(
-        "\n[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-    console.print(
-        "[bold green][✓] Network scan complete[/bold green]"
-    )
-    console.print(
-        f"[cyan][*] Hosts processed: "
-        f"{len(all_results)}/{len(hosts)}[/cyan]"
-    )
-    console.print(
-        f"[cyan][*] Total open ports: {total_open}[/cyan]"
-    )
-    console.print(
-        "[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-
-    return all_results
+    workers = [
+        threading.Thread(target=worker, name=f"spectrascan-host-{i}", daemon=True)
+        for i in range(host_workers)
+    ]
+    for thread in workers:
+        thread.start()
+    producer_thread = threading.Thread(target=producer, name="spectrascan-host-producer", daemon=True)
+    producer_thread.start()
+    producer_thread.join()
+    work_queue.join()
+    for thread in workers:
+        thread.join()
+    if errors:
+        console.print(f"[yellow][!] {len(errors)} host scan error(s) occurred.[/yellow]")
+    results.sort(key=lambda item: ipaddress.ip_address(item["ip"]))
+    return results
 
 
 @guard_interrupt
@@ -6634,6 +6591,10 @@ def run_port_scan_cli():
         choices=["tcp", "syn", "udp"],
         default="tcp",
     )
+
+    if scan_type == "syn" and not SYNScan().is_admin:
+        console.print("[!] SYN scans require root/administrator privileges. Returning to menu.", style="bold red")
+        return
 
     timing = Prompt.ask(
         "Timing Profile",
@@ -6870,47 +6831,444 @@ def print_main_menu():
     console.print("[bold red]4.[/bold red] Exit")
  
  
-def main():
-    # Legacy CLI args for backward compatibility / scripting
-    if len(sys.argv) > 1:
-        parser = argparse.ArgumentParser(description="SpectraScan Legacy CLI")
-        parser.add_argument("-t", "--target", help="Target")
-        parser.add_argument("-d", "--domain", help="Domain")
-        parser.add_argument("-i", "--ip", help="IP")
-        parser.add_argument("--async-scan", action="store_true", help="Use the asyncio/aiohttp scanner engine for TCP scans")
-        parser.add_argument("--async-concurrency", type=int, default=100, help="Maximum concurrent async connections (default: 100)")
-        parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout in seconds (default: 1.0)")
-        args, _ = parser.parse_known_args()
+def _cli_parser():
+    parser = argparse.ArgumentParser(
+        description="SpectraScan — authorized network reconnaissance and reporting",
+        allow_abbrev=False,
+    )
+    targets = parser.add_mutually_exclusive_group(required=False)
+    targets.add_argument("-t", "--target", help="IP address, hostname, URL, or CIDR network")
+    targets.add_argument("-d", "--domain", help="Run passive-first domain intelligence")
+    targets.add_argument("-i", "--ip", help="Run IP intelligence")
+    targets.add_argument("-e", "--email", help="Check public email reputation")
+    targets.add_argument("--phone", help="Look up a phone number")
+    targets.add_argument("--image", help="Extract metadata from a local image")
+    parser.add_argument("-p", "--ports", default="common", help="Ports: comma list, range (1-1024), common, or all")
+    parser.add_argument("-T", "--timing", choices=sorted(TIMING_PROFILES), default="T3", help="Port-scan timing profile")
+    parser.add_argument("--scan-type", choices=("tcp", "syn", "udp"), default="tcp", help="Select TCP connect, SYN, or UDP probing")
+    parser.add_argument("--timeout", type=float, default=None, help="Override connection timeout in seconds")
+    parser.add_argument("--threads", type=int, default=None, help="Override timing-profile port worker count (1-128)")
+    parser.add_argument("--async-scan", action="store_true", help="Use the bounded asyncio TCP scanner")
+    parser.add_argument("--async-concurrency", type=int, default=100, help="Async connections (1-512)")
+    parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout (0-120 seconds)")
+    parser.add_argument("--vuln-scan", action="store_true", help="Enable built-in service/port vulnerability heuristics")
+    parser.add_argument("--cve-correlate", action="store_true", help="Query NVD for version/CPE correlation on a bounded number of detected services") 
+    parser.add_argument("--max-cve-lookups", type=int, default=3, help="Maximum distinct product/version NVD lookups (1-20)")
+    parser.add_argument("--os-detect", action="store_true", help="Record TTL-based OS fingerprint evidence")
+    parser.add_argument("--web-enum", action="store_true", help="Enumerate web paths using --wordlist")
+    parser.add_argument("--wordlist", help="Wordlist for --web-enum")
+    parser.add_argument("-l", "--links", action="store_true", help="Collect links for a domain target")
+    parser.add_argument("--shodan", action="store_true", help="Request Shodan enrichment (requires -i/--ip and SHODAN_API_KEY)")
+    parser.add_argument("--brute-force", action="store_true", help="Run bounded SSH/FTP credential validation against an authorized target")
+    parser.add_argument("--service", choices=("ssh", "ftp"), help="Service for --brute-force")
+    parser.add_argument("--port", type=int, help="Service port for --brute-force")
+    parser.add_argument("--max-attempts", type=int, default=None, help="Maximum passwords from the wordlist (1-1000; only for --brute-force)")
+    parser.add_argument("--ssh-known-hosts", help="Optional SSH known_hosts file")
+    parser.add_argument("--ssh-host-fingerprint", help="Pin SSH host key using OpenSSH SHA256: fingerprint")
+    parser.add_argument("--allow-insecure-ftp", action="store_true", help="Allow plaintext FTP credentials (unsafe; requires --yes and --service ftp)")
+    parser.add_argument("--smb", action="store_true", help="Run SMB enumeration against --target")
+    parser.add_argument("--ldap", action="store_true", help="Run LDAP enumeration against --target")
+    parser.add_argument("--dns-zone", action="store_true", help="Check DNS zone transfer against --domain")
+    parser.add_argument("-o", "--output", help="Write a report to this path")
+    parser.add_argument("-f", "--format", choices=("json", "html", "csv"), help="Report format; inferred from output extension if omitted")
+    parser.add_argument("--exclude", action="append", default=[], help="Exclude an IP/CIDR from a network scan; repeatable")
+    parser.add_argument("--max-targets", type=int, default=1024, help="Hard cap on CIDR address count (1-65536)")
+    parser.add_argument("--yes", action="store_true", help="Confirm large scans and port ranges explicitly")
+    return parser
 
-        if args.target:
+
+def correlate_open_port_cves(open_ports, max_lookups=3, api_key=None):
+    """Correlate unique detected service versions with NVD; static matches stay potential."""
+    if isinstance(max_lookups, bool) or not 1 <= int(max_lookups) <= 20:
+        raise ValueError("max_lookups must be between 1 and 20")
+    if api_key is None:
+        api_key = os.environ.get("NVD_API_KEY")
+    identity_rules = (
+        ("openssh", "openbsd", "openssh"),
+        ("dropbear", "dropbear_ssh_project", "dropbear_ssh"),
+        ("nginx", "nginx", "nginx"),
+        ("apache httpd", "apache", "http_server"),
+        ("apache/", "apache", "http_server"),
+        ("mariadb", "mariadb", "mariadb"),
+        ("mysql", "oracle", "mysql"),
+        ("redis", "redis", "redis"),
+        ("vsftpd", "vsftpd_project", "vsftpd"),
+        ("proftpd", "proftpd_project", "proftpd"),
+    )
+    unique = {}
+    for item in open_ports:
+        banner = str(item.get("banner") or "")
+        version_info = item.get("version_info") or {}
+        version = str(version_info.get("version") or "").strip()
+        if not version or version.lower() == "unknown":
+            continue
+        combined = (banner + " " + str(item.get("service") or "") + " " + str(version_info.get("type") or "")).lower()
+        identity = next((rule for rule in identity_rules if rule[0] in combined), None)
+        if identity:
+            _, vendor, product = identity
+        else:
+            service = str(version_info.get("type") or item.get("service") or "").lower()
+            if not service or service == "unknown":
+                continue
+            vendor = ""
+            product = re.sub(r"[^a-z0-9_.-]+", "_", service).strip("_.-")
+            if not product:
+                continue
+        key = (vendor, product, version)
+        unique.setdefault(key, []).append(item)
+
+    findings = []
+    errors = []
+    attempted = 0
+    for (vendor, product, version), ports_for_product in list(unique.items())[:int(max_lookups)]:
+        attempted += 1
+        try:
+            scanner = VulnScanner(
+                product, version, vendor=vendor, product=product,
+                api_key=api_key, timeout=8.0, max_records=100,
+            )
+            matches = scanner.check_nvd_api()
+            for finding in matches:
+                findings.append({
+                    **finding,
+                    "vendor": vendor or None,
+                    "product": product,
+                    "detected_version": version,
+                    "ports": sorted({int(item["port"]) for item in ports_for_product if item.get("port") is not None}),
+                })
+            if scanner.errors:
+                errors.extend({
+                    "vendor": vendor or None, "product": product, "version": version, **error
+                } for error in scanner.errors)
+        except Exception as exc:
+            errors.append({
+                "category": "correlation_error", "vendor": vendor or None,
+                "product": product, "version": version, "message": type(exc).__name__,
+            })
+    skipped = max(0, len(unique) - attempted)
+    return {
+        "source": "NVD",
+        "queries_attempted": attempted,
+        "unique_detected_products": len(unique),
+        "queries_skipped_by_limit": skipped,
+        "findings": findings,
+        "errors": errors,
+        "note": "Version/CPE correlations are static evidence and are not proof that a target is exploitable. Verify patch level and exploit preconditions.",
+    }
+
+
+def _write_cli_report(report, output_path, fmt):
+    fmt = fmt or os.path.splitext(output_path)[1].lstrip(".").lower()
+    if fmt == "json":
+        return atomic_write_json(output_path, report)
+    if fmt == "html":
+        pretty = html.escape(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+        document = "<!doctype html><html><head><meta charset=\"utf-8\"><title>SpectraScan Report</title></head><body><h1>SpectraScan Report</h1><pre>" + pretty + "</pre></body></html>"
+        return atomic_write_text(output_path, document)
+    if fmt != "csv":
+        raise ValueError("Report format must be json, html, or csv")
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream)
+    writer.writerow(["Target", "Port", "Protocol", "State", "Service", "Banner", "Classification"])
+    rows = list(report.get("open_ports", []))
+    for host in report.get("hosts", []):
+        for port in host.get("ports", []):
+            rows.append({"target": host.get("ip"), **port})
+    for item in rows:
+        service = item.get("service", "")
+        if isinstance(service, tuple):
+            service = " ".join(str(part) for part in service if part)
+        writer.writerow([
+            safe_csv_cell(item.get("target", report.get("target", ""))),
+            safe_csv_cell(item.get("port", "")),
+            safe_csv_cell(item.get("protocol", report.get("scan_type", "tcp"))),
+            safe_csv_cell(item.get("state", "")), safe_csv_cell(service),
+            safe_csv_cell((item.get("banner", "") or "")[:500]),
+            safe_csv_cell(item.get("classification", "")),
+        ])
+    return atomic_write_text(output_path, stream.getvalue())
+
+
+def main(argv: Optional[List[str]] = None):
+    if argv is None:
+        argv = sys.argv[1:]
+    # Keep the interactive menu for an argument-free launch.
+    if argv:
+        parser = _cli_parser()
+        args = parser.parse_args(argv)
+
+        def option_was_provided(*names):
+            return any(token in argv for token in names)
+
+        port_options = (
+            option_was_provided("-p", "--ports", "-T", "--timing", "--timeout",
+                                "--async-scan", "--async-concurrency", "--async-timeout",
+                                "--scan-type", "--vuln-scan", "--cve-correlate", "--max-cve-lookups", "--os-detect", "--web-enum",
+                                "--max-targets", "--exclude")
+        )
+        non_port_target = any((args.domain, args.ip, args.email, args.phone, args.image))
+        module_target = any((args.smb, args.ldap, args.brute_force))
+        if non_port_target and port_options:
+            parser.error("port-scan options cannot be combined with domain, IP, email, phone, or image modes")
+        if module_target and port_options:
+            parser.error("port-scan options cannot be combined with SMB/LDAP/credential-validation modes")
+        if args.web_enum and not args.target:
+            parser.error("--web-enum requires -t/--target")
+        if args.web_enum and args.brute_force:
+            parser.error("--web-enum and --brute-force must run separately")
+        if args.vuln_scan and args.async_scan:
+            parser.error("--vuln-scan is not supported by --async-scan yet")
+        if args.cve_correlate and args.async_scan:
+            parser.error("--cve-correlate requires legacy service/version detection; remove --async-scan")
+        if not 1 <= args.max_cve_lookups <= 20:
+            parser.error("--max-cve-lookups must be between 1 and 20")
+        if args.max_cve_lookups != 3 and not args.cve_correlate:
+            parser.error("--max-cve-lookups requires --cve-correlate")
+        if args.vuln_scan and args.scan_type == "udp":
+            parser.error("--vuln-scan is not supported by UDP probes")
+        if args.wordlist and not (args.web_enum or args.brute_force):
+            parser.error("--wordlist requires --web-enum or --brute-force")
+        if not any((args.target, args.domain, args.ip, args.email, args.phone, args.image)):
+            parser.error("choose one target using -t/--target, -d/--domain, -i/--ip, -e/--email, --phone, or --image")
+        if args.shodan and not args.ip:
+            parser.error("--shodan requires -i/--ip")
+        if args.links and not args.domain:
+            parser.error("--links requires -d/--domain")
+        if args.dns_zone and not args.domain:
+            parser.error("--dns-zone requires -d/--domain")
+        if (args.smb or args.ldap or args.brute_force) and not args.target:
+            parser.error("--smb, --ldap, and --brute-force require -t/--target")
+        if args.brute_force:
+            if not args.wordlist or not args.service or args.port is None:
+                parser.error("--brute-force requires --wordlist, --service ssh|ftp, and --port")
+            if not args.yes:
+                parser.error("--brute-force requires explicit confirmation with --yes")
+            if not 1 <= args.port <= 65535:
+                parser.error("--port must be between 1 and 65535")
+            if args.max_attempts is None:
+                args.max_attempts = 100
+            if not 1 <= args.max_attempts <= 1000:
+                parser.error("--max-attempts must be between 1 and 1000")
+            if args.service != "ssh" and args.ssh_host_fingerprint:
+                parser.error("--ssh-host-fingerprint is only valid with --service ssh")
+            if args.allow_insecure_ftp and args.service != "ftp":
+                parser.error("--allow-insecure-ftp requires --service ftp")
+        elif args.service or args.port is not None or args.ssh_known_hosts or args.ssh_host_fingerprint or args.allow_insecure_ftp or args.max_attempts is not None:
+            parser.error("--service, --port, SSH host-key options, --allow-insecure-ftp, and --max-attempts require --brute-force")
+        if args.email and not EMAIL_REGEX.fullmatch(args.email):
+            parser.error("--email must be a valid email address")
+        if args.phone and detect_target_type(args.phone).get("type") != "phone":
+            parser.error("--phone must be a phone number in a recognized format")
+        if not 1 <= args.max_targets <= 65536:
+            parser.error("--max-targets must be between 1 and 65536")
+        if args.threads is not None and not 1 <= args.threads <= 128:
+            parser.error("--threads must be between 1 and 128")
+        if args.timeout is not None and (not math.isfinite(args.timeout) or not 0 < args.timeout <= 120):
+            parser.error("--timeout must be greater than 0 and at most 120 seconds")
+        if args.async_scan and args.scan_type != "tcp":
+            parser.error("--async-scan supports only --scan-type tcp")
+        if args.async_scan and args.timeout is not None:
+            parser.error("use --async-timeout with --async-scan instead of --timeout")
+        if args.scan_type == "syn" and not SYNScan().is_admin:
+            parser.error("--scan-type syn requires root/administrator privileges; no TCP-connect fallback is performed")
+        if args.web_enum and not args.wordlist:
+            parser.error("--web-enum requires --wordlist")
+        if args.format and not args.output:
+            parser.error("--format requires --output")
+        if args.output and not args.format and os.path.splitext(args.output)[1].lower() not in {".json", ".html", ".csv"}:
+            parser.error("cannot infer report format; specify --format json|html|csv")
+        if args.output and args.format and os.path.splitext(args.output)[1] and os.path.splitext(args.output)[1].lower() != "." + args.format:
+            parser.error("--format conflicts with output file extension")
+
+        manager = ReportManager()
+
+        def finish_report(report):
+            if args.output:
+                saved = _write_cli_report(report, args.output, args.format)
+                console.print(f"[green][+] Report saved: {saved}[/green]")
+            else:
+                console.print(json.dumps(report, indent=2, ensure_ascii=False, default=str), markup=False)
+            return 0
+
+        if args.email:
+            EmailScanner.scan(args.email, manager)
+            return finish_report({
+                "module": "Email Intelligence", "target": args.email,
+                "timestamp": datetime.now().isoformat(), "output": manager._buffer,
+            })
+        if args.phone:
+            PhoneScanner.scan(args.phone, manager)
+            return finish_report({
+                "module": "Phone Intelligence", "target": args.phone,
+                "timestamp": datetime.now().isoformat(), "output": manager._buffer,
+            })
+        if args.image:
+            ImageScanner.scan(args.image, manager)
+            return finish_report({
+                "module": "Image Metadata", "target": args.image,
+                "timestamp": datetime.now().isoformat(), "output": manager._buffer,
+            })
+        if args.domain:
+            domain_report = DomainScanner.scan(args.domain, manager)
+            if domain_report is None:
+                parser.error("domain scan could not validate the requested domain")
+            report = domain_report
+            if args.links:
+                LinkScanner.scan(args.domain, manager)
+                report = {"target": args.domain, "domain_intelligence": domain_report, "link_output": manager._buffer}
+            if args.dns_zone:
+                report = {
+                    "target": args.domain, "domain_intelligence": domain_report,
+                    "dns_zone": DNSZone.scan(args.domain), "output": manager._buffer,
+                }
+            return finish_report(report)
+        if args.ip:
             try:
-                target = normalize_target(args.target)
+                ipaddress.ip_address(args.ip)
+            except ValueError:
+                parser.error("--ip must be a valid IPv4 or IPv6 address")
+            IPScanner.scan(args.ip, manager, include_shodan=args.shodan)
+            return finish_report({
+                "module": "IP Intelligence", "target": args.ip,
+                "shodan_requested": args.shodan,
+                "timestamp": datetime.now().isoformat(), "output": manager._buffer,
+            })
+
+        target = normalize_target(args.target)
+        if args.smb or args.ldap or args.brute_force:
+            if "/" in target:
+                parser.error("protocol enumeration and credential validation require a single host, not a CIDR")
+            try:
                 resolved_ip = resolve_host(target)
-
-                if args.async_scan:
-                    scanner = AsyncPortScanner(target, ports=list(COMMON_PORTS.keys()), timeout=args.async_timeout, concurrency=args.async_concurrency)
-                    scanner.resolved_ip = resolved_ip
-                    asyncio.run(scanner.scan_async())
-                    result = scanner.get_results()
-                    console.print(f"[green][✓] Async scan completed in {result['duration']:.2f}s — {len(result['open_ports'])} open ports[/green]")
-                    for item in sorted(result["open_ports"], key=lambda value: value["port"]):
-                        console.print(f"[green][+] {item['port']}/tcp {item.get('service', 'unknown')} {item.get('banner', '')[:80]}[/green]")
-                else:
-                    scanner = PortScanner(target)
-                    scanner.resolved_ip = resolved_ip
-                    scanner.scan()
-                    scanner.print_summary()
-            except Exception as exc:
-                console.print(
-                    f"[!] Scan failed: {exc}",
-                    style="bold red",
+            except (ValueError, socket.gaierror) as exc:
+                parser.error(str(exc))
+            modules = {}
+            if args.smb:
+                modules["smb"] = SMBEnumerator.scan(resolved_ip)
+            if args.ldap:
+                modules["ldap"] = LDAPEnumerator.scan(resolved_ip)
+            if args.brute_force:
+                brute = BruteForcer(
+                    resolved_ip, args.port, args.service, args.wordlist,
+                    max_threads=min(args.threads or 10, 32),
+                    known_hosts_path=args.ssh_known_hosts,
+                    expected_host_fingerprint=args.ssh_host_fingerprint,
+                    max_passwords=args.max_attempts,
+                    allow_insecure_ftp=args.allow_insecure_ftp,
                 )
-                sys.exit(1)
+                modules["credential_validation"] = {
+                    "target": resolved_ip, "port": args.port, "service": args.service,
+                    "passwords_checked_per_username": len(brute.load_wordlist()),
+                    "results": brute.run(),
+                    "error_counts": dict(brute.error_counts),
+                }
+            return finish_report({
+                "target": target, "resolved_ip": resolved_ip, "modules": modules,
+                "timestamp": datetime.now().isoformat(),
+            })
+        if not target:
+            parser.error("target cannot be empty")
+        try:
+            network = ipaddress.ip_network(target, strict=False)
+            is_network = "/" in target
+        except ValueError:
+            network = None
+            is_network = False
+        if args.links:
+            parser.error("--links is supported with --domain; use -d/--domain")
+        if args.shodan or args.dns_zone or args.smb or args.ldap or args.brute_force:
+            parser.error("the selected module option is incompatible with this scan")
+        if args.phone or args.image or args.email:
+            parser.error("OSINT options cannot be combined with a port scan")
+        if args.scan_type == "udp" and args.ports.strip().lower() == "common":
+            ports = sorted(UDPScan().common_udp_ports)
+        else:
+            ports = parse_ports(args.ports)
+        if ports is None:
+            parser.error(f"invalid --ports value: {args.ports!r}; use comma-separated ports, ranges, common, or all")
+        if len(ports) > 5000 and not args.yes:
+            parser.error("large port ranges require explicit confirmation; add --yes")
+        if args.async_scan:
+            if not 1 <= args.async_concurrency <= 512:
+                parser.error("--async-concurrency must be between 1 and 512")
+            if not math.isfinite(args.async_timeout) or not 0 < args.async_timeout <= 120:
+                parser.error("--async-timeout must be greater than 0 and at most 120 seconds")
+            if len(ports) > 10000 and not args.yes:
+                parser.error("async scans over 10000 ports require --yes")
 
-            return
- 
+        scan_kwargs = {
+            "timeout": args.timeout if args.timeout is not None else TIMING_PROFILES[args.timing]["timeout"],
+            "threads": args.threads if args.threads is not None else TIMING_PROFILES[args.timing]["threads"],
+            "scan_type": args.scan_type,
+            "timing": "custom",
+            "ports": ports, "decoys": [], "check_vulns": args.vuln_scan, "rate_limit": 0,
+        }
+        if is_network and args.cve_correlate:
+            parser.error("--cve-correlate is restricted to a single host to bound NVD API requests")
+        if is_network and (args.web_enum or args.os_detect):
+            parser.error("--web-enum and --os-detect require a single host target, not a CIDR network")
+        if is_network:
+            if network.version != 4:
+                parser.error("CIDR port sweeps currently support IPv4 only; use a single IPv6 target")
+            if network.num_addresses > args.max_targets:
+                parser.error(f"network has {network.num_addresses} addresses, exceeding --max-targets={args.max_targets}")
+            if network.num_addresses > 64 and not args.yes:
+                parser.error("large network scan requires explicit confirmation; add --yes")
+            results = run_network_port_scan(
+                str(network), scan_kwargs, exclusions=args.exclude,
+                max_targets=args.max_targets, large_scan_confirmed=args.yes,
+            )
+            report = {
+                "target": str(network), "scan_type": args.scan_type,
+                "timestamp": datetime.now().isoformat(), "hosts": results, "open_ports": [],
+            }
+        else:
+            resolved_ip = None
+            if args.async_scan:
+                scanner = AsyncPortScanner(
+                    target, ports=ports, timeout=args.async_timeout,
+                    concurrency=args.async_concurrency,
+                )
+                try:
+                    scanner.scan()
+                    resolved_ip = scanner.resolved_ip
+                    report = scanner.get_results()
+                except (ValueError, OSError, asyncio.TimeoutError) as exc:
+                    parser.error(f"async scan failed: {exc}")
+            else:
+                try:
+                    resolved_ip = resolve_host(target)
+                    if ipaddress.ip_address(resolved_ip).version == 6:
+                        parser.error("single IPv6 targets require --async-scan; legacy TCP/SYN/UDP scanners are IPv4-only")
+                except ValueError as exc:
+                    parser.error(str(exc))
+                scanner = PortScanner(target, **scan_kwargs)
+                scanner.resolved_ip = resolved_ip
+                scanner.scan()
+                report = scanner.get_results()
+            if args.cve_correlate:
+                report["cve_correlation"] = correlate_open_port_cves(
+                    report.get("open_ports", []),
+                    max_lookups=args.max_cve_lookups,
+                    api_key=os.environ.get("NVD_API_KEY"),
+                )
+            if args.os_detect:
+                try:
+                    report["os_fingerprint_ttl"] = OSFingerprint.get_ttl(resolved_ip)
+                    report["os_fingerprint_note"] = "TTL heuristic only; not definitive OS identification."
+                except Exception:
+                    report["os_fingerprint_ttl"] = None
+            if args.web_enum:
+                base_url = target if target.lower().startswith(("http://", "https://")) else "http://" + target
+                report["web_enumeration"] = WebEnumerator(base_url, args.wordlist).run()
+        if args.output:
+            saved = _write_cli_report(report, args.output, args.format)
+            console.print(f"[green][+] Report saved: {saved}[/green]")
+        elif args.scan_type == "udp":
+            console.print("[yellow]UDP silence is reported as open|filtered; it is not proof of an open port.[/yellow]")
+        return 0
+
     print_banner()
-    
     while True:
         print_main_menu()
         try:
@@ -6918,7 +7276,6 @@ def main():
         except (KeyboardInterrupt, EOFError):
             console.print("\n[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
             break
- 
         if choice == "4":
             console.print("[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
             break
@@ -6926,7 +7283,8 @@ def main():
             MENU_ACTIONS[choice][1]()
         else:
             console.print("[!] Invalid Option. Please try again.", style="red")
- 
- 
+    return 0
+
+
 if __name__ == "__main__":
     main()

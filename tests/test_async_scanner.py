@@ -12,6 +12,20 @@ class TestAsyncPortScanner(unittest.TestCase):
         with self.assertRaises(ValueError):
             AsyncPortScanner("127.0.0.1", ports=[80], concurrency=0)
 
+    def test_invalid_ports_are_rejected(self):
+        for invalid in (0, -1, 65536, "abc"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    AsyncPortScanner("127.0.0.1", ports=[invalid])
+
+    def test_empty_ports_are_rejected(self):
+        with self.assertRaises(ValueError):
+            AsyncPortScanner("127.0.0.1", ports=[])
+
+    def test_concurrency_upper_bound_is_enforced(self):
+        with self.assertRaises(ValueError):
+            AsyncPortScanner("127.0.0.1", ports=[80], concurrency=513)
+
     def test_async_tcp_scan_finds_local_listener(self):
         async def scenario():
             async def handle(reader, writer):

@@ -355,7 +355,7 @@ SpectraScan keeps scan output organized and reusable.
 
 | Requirement | Purpose | Required? |
 |---|---|---|
-| Python 3.9+ | Core runtime | ✅ |
+| Python 3.10+ | Core runtime | ✅ |
 | Root / Administrator | Raw sockets for SYN scans | Only for SYN mode |
 | Tor on `127.0.0.1:9050` | `.onion` operations | Only for onion features |
 | `exiv2` or `exiftool` | Image metadata | Optional |
@@ -456,6 +456,22 @@ python SpectraScan.py -t scanme.nmap.org -p 1-1000 -T T3
 
 ## 🚀 Usage
 
+### One-shot OSINT and protocol modules
+
+The one-shot CLI now accepts the supported README options and rejects flags that do not apply to the selected mode:
+
+```bash
+python SpectraScan.py -e target@example.com -o email.json
+python SpectraScan.py --phone "+14155552671" -o phone.json
+python SpectraScan.py --image ./photo.jpg -o image.json
+python SpectraScan.py -d example.com --links --dns-zone -o domain.json
+python SpectraScan.py -i 8.8.8.8 --shodan -o ip.json
+python SpectraScan.py -t 10.0.0.5 --smb -o smb.json
+python SpectraScan.py -t 10.0.0.5 --ldap -o ldap.json
+```
+
+Credential-validation mode requires an explicit target, service, port, bounded password limit and `--yes` acknowledgement. SSH checks require trusted host keys or an optional SHA256 fingerprint pin. FTPS is the default for FTP service checks; plaintext FTP is available only with explicit `--allow-insecure-ftp`. Configure `NUMVERIFY_KEY` and `SHODAN_API_KEY` (or `SHODAN_KEY`) through environment variables. Never commit API keys to the repository.
+
 ### 🔍 Basic Reconnaissance
 
 ```bash
@@ -476,7 +492,7 @@ python SpectraScan.py -t 10.0.0.5 --scan-type udp -p 53,161,514
 python SpectraScan.py -e target@example.com
 
 # Domain intelligence + link sniffing
-python SpectraScan.py -d targetdomain.com -l
+python SpectraScan.py -d targetdomain.com --links
 
 # IP intelligence + Shodan
 python SpectraScan.py --ip 8.8.8.8 --shodan
@@ -495,7 +511,11 @@ python SpectraScan.py --image ./photo.jpg
 python SpectraScan.py -t target.com --vuln-scan
 
 # SSH / FTP credential testing
-python SpectraScan.py -t 10.0.0.5 --brute-force --wordlist ./passwords.txt
+python SpectraScan.py -t 10.0.0.5 --brute-force --service ssh --port 22 --wordlist ./passwords.txt --max-attempts 100 --yes
+
+# FTPS is used by default; plaintext FTP requires explicit opt-in:
+python SpectraScan.py -t 10.0.0.5 --brute-force --service ftp --port 21 --wordlist ./passwords.txt --yes
+# For a legacy plaintext FTP service only, add --allow-insecure-ftp
 
 # Web directory enumeration
 python SpectraScan.py -t example.com --web-enum --wordlist ./dirb_list.txt
@@ -532,6 +552,17 @@ Available operations:
 | `6` | Tor connectivity check | ✅ |
 | `7` | Full recon | Depends |
 | `8` | Back | — |
+
+### Evidence-based CVE correlation
+
+The optional NVD correlation mode is separate from local port/service heuristics so ordinary scans do not unexpectedly make external API calls:
+
+```bash
+python SpectraScan.py -t 127.0.0.1 -p 22,80,443 --cve-correlate -o findings.json
+python SpectraScan.py -t 127.0.0.1 -p 22,80,443 --cve-correlate --max-cve-lookups 5 -o findings.json
+```
+
+Only distinct detected products with a usable version are queried; at most 3 lookups run by default (maximum 20). Configure `NVD_API_KEY` through the environment. Static CPE/version matches are classified as **potential** unless there is stronger evidence; they are not proof of exploitability.
 
 ### 📊 Reports
 
@@ -683,7 +714,7 @@ SpectraScan/
 | `TOR_PORT` | `9050` | Tor SOCKS5 port |
 | `SPECTRASCAN_HOME` | `~/.local/share/SpectraScan` | Report directory |
 | `NUMVERIFY_KEY` | — | NumVerify API key |
-| `SHODAN_KEY` | — | Shodan API key |
+| `SHODAN_API_KEY` / `SHODAN_KEY` | — | Shodan API key |
 | `NVD_API_KEY` | — | NVD API key |
 | `EMAILREP_KEY` | — | emailrep.io key |
 | `HTTP_PROXY` | — | Global outbound HTTP proxy |
@@ -738,6 +769,21 @@ CLI usage:
 python SpectraScan.py -t scanme.nmap.org --async-scan
 python SpectraScan.py -t scanme.nmap.org --async-scan --async-concurrency 200 --async-timeout 0.75
 ```
+
+## CLI hardening notes
+
+The one-shot CLI rejects unsupported arguments instead of silently ignoring them. Examples:
+
+```bash
+python SpectraScan.py -t scanme.nmap.org -p 1-1000 -T T3 --scan-type tcp
+python SpectraScan.py -t scanme.nmap.org -p 80,443 -o report.json
+python SpectraScan.py -t 192.168.1.1 --scan-type udp -p 53,161 -o udp-report.json
+python SpectraScan.py -t 192.168.1.0/24 -p common --exclude 192.168.1.10 --yes -o network.json
+python SpectraScan.py -d example.com -o domain.json
+python SpectraScan.py -i 8.8.8.8 -o ip-intelligence.json
+```
+
+CIDR scans have a hard address limit set by --max-targets (default 1024), and scans over 64 addresses require explicit --yes confirmation. Exclusions can be repeated. UDP silence is reported as open|filtered, not confirmed open. Historical reports use SPECTRASCAN_HOME (default ~/.local/share/SpectraScan) and exports use atomic writes. SSH credential checks require known-host trust or a pinned SHA256 fingerprint and never store plaintext passwords.
 
 ## 🛣️ Roadmap
 
