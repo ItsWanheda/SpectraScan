@@ -456,6 +456,22 @@ python SpectraScan.py -t scanme.nmap.org -p 1-1000 -T T3
 
 ## 🚀 Usage
 
+### One-shot OSINT and protocol modules
+
+The one-shot CLI now accepts the supported README options and rejects flags that do not apply to the selected mode:
+
+```bash
+python SpectraScan.py -e target@example.com -o email.json
+python SpectraScan.py --phone "+14155552671" -o phone.json
+python SpectraScan.py --image ./photo.jpg -o image.json
+python SpectraScan.py -d example.com --links --dns-zone -o domain.json
+python SpectraScan.py -i 8.8.8.8 --shodan -o ip.json
+python SpectraScan.py -t 10.0.0.5 --smb -o smb.json
+python SpectraScan.py -t 10.0.0.5 --ldap -o ldap.json
+```
+
+Credential-validation mode requires an explicit target, service, port, bounded password limit and `--yes` acknowledgement. SSH checks require trusted host keys or an optional SHA256 fingerprint pin. FTPS is the default for FTP service checks; plaintext FTP is available only with explicit `--allow-insecure-ftp`. Configure `NUMVERIFY_KEY` and `SHODAN_API_KEY` (or `SHODAN_KEY`) through environment variables. Never commit API keys to the repository.
+
 ### 🔍 Basic Reconnaissance
 
 ```bash
@@ -476,7 +492,7 @@ python SpectraScan.py -t 10.0.0.5 --scan-type udp -p 53,161,514
 python SpectraScan.py -e target@example.com
 
 # Domain intelligence + link sniffing
-python SpectraScan.py -d targetdomain.com -l
+python SpectraScan.py -d targetdomain.com --links
 
 # IP intelligence + Shodan
 python SpectraScan.py --ip 8.8.8.8 --shodan
@@ -495,7 +511,11 @@ python SpectraScan.py --image ./photo.jpg
 python SpectraScan.py -t target.com --vuln-scan
 
 # SSH / FTP credential testing
-python SpectraScan.py -t 10.0.0.5 --brute-force --wordlist ./passwords.txt
+python SpectraScan.py -t 10.0.0.5 --brute-force --service ssh --port 22 --wordlist ./passwords.txt --max-attempts 100 --yes
+
+# FTPS is used by default; plaintext FTP requires explicit opt-in:
+python SpectraScan.py -t 10.0.0.5 --brute-force --service ftp --port 21 --wordlist ./passwords.txt --yes
+# For a legacy plaintext FTP service only, add --allow-insecure-ftp
 
 # Web directory enumeration
 python SpectraScan.py -t example.com --web-enum --wordlist ./dirb_list.txt
@@ -683,7 +703,7 @@ SpectraScan/
 | `TOR_PORT` | `9050` | Tor SOCKS5 port |
 | `SPECTRASCAN_HOME` | `~/.local/share/SpectraScan` | Report directory |
 | `NUMVERIFY_KEY` | — | NumVerify API key |
-| `SHODAN_KEY` | — | Shodan API key |
+| `SHODAN_API_KEY` / `SHODAN_KEY` | — | Shodan API key |
 | `NVD_API_KEY` | — | NVD API key |
 | `EMAILREP_KEY` | — | emailrep.io key |
 | `HTTP_PROXY` | — | Global outbound HTTP proxy |
