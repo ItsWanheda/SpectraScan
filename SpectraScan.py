@@ -5207,9 +5207,24 @@ class PortScanner:
             "vulnerabilities": self.vulnerabilities,
         }
 
+    @staticmethod
+    def _atomic_write(filename: str, writer):
+        """Write report to a sibling temporary file and atomically replace destination."""
+        destination = os.path.abspath(filename)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        temporary = destination + ".tmp"
+        try:
+            writer(temporary)
+            with open(temporary, "rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+
     def export_json(self, filename: str):
-        with open(filename, "w") as f:
-            json.dump(self.get_results(), f, indent=2, default=str)
+        payload = json.dumps(self.get_results(), indent=2, default=str)
+        self._atomic_write(filename, lambda path: open(path, "w", encoding="utf-8").write(payload))
         print(f"{GREEN}[+] JSON report saved: {filename}")
 
     def export_html(self, filename: str):
@@ -5219,91 +5234,59 @@ class PortScanner:
         resolved_ip = html.escape(str(results.get("resolved_ip", "") or ""))
         timestamp = html.escape(str(results.get("timestamp", "")))
         duration = f"{results.get('duration', 0):.2f}"
-
-        parts = [f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>SpectraScan Report - {target}</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-        h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
-        .summary {{ background: #e9ecef; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-        th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background: #007bff; color: white; }}
-        tr:hover {{ background: #f1f1f1; }}
-        .open {{ color: #28a745; font-weight: bold; }}
-        .closed {{ color: #dc3545; }}
-        .filtered {{ color: #ffc107; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>SpectraScan Report</h1>
-        <div class="summary">
-            <p><strong>Target:</strong> {target}</p>
-            <p><strong>Resolved IP:</strong> {resolved_ip}</p>
-            <p><strong>Scan Type:</strong> {scan_type}</p>
-            <p><strong>Timestamp:</strong> {timestamp}</p>
-            <p><strong>Duration:</strong> {duration}s</p>
-            <p><strong>Open Ports:</strong> {len(results.get('open_ports', []))}</p>
-            <p><strong>Vulnerabilities:</strong> {len(results.get('vulnerabilities', []))}</p>
-        </div>
-        <h2>Open Ports</h2>
-        <table>
-            <tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr>"""]
-
-        for port in results.get("open_ports", []):
-            port_num = html.escape(str(port.get("port", "")))
-            service = port.get("service", "")
+        rows = []
+        for item in results.get("open_ports", []):
+            port = html.escape(str(item.get("port", "")))
+            service = item.get("service", "")
             if isinstance(service, tuple):
                 service = service if service else ""
             service = html.escape(str(service))
-            state = html.escape(str(port.get("state", "")))
-            banner = html.escape((port.get("banner", "") or "N/A")[:50])
-            parts.append(
-                f"<tr><td>{port_num}</td><td>{service}</td>"
-                f"<td class='open'>{state}</td><td>{banner}</td></tr>"
-            )
-
-        parts.append("""        </table>
-    </div>
-</body>
-</html>""")
-
-        with open(filename, "w") as f:
-            f.write("".join(parts))
+            state = html.escape(str(item.get("state", "")))
+            banner = html.escape(str(item.get("banner", "") or "N/A")[:200])
+            rows.append(f"<tr><td>{port}</td><td>{service}</td><td>{state}</td><td>{banner}</td></tr>")
+        document = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>SpectraScan Report - {target}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{{font-family:Arial,sans-serif;margin:2rem}}table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #ddd;padding:.5rem;text-align:left}}th{{background:#222;color:white}}</style>
+</head><body><h1>SpectraScan Report</h1>
+<p>Target: {target}</p><p>Resolved IP: {resolved_ip}</p><p>Scan type: {scan_type}</p>
+<p>Timestamp: {timestamp}</p><p>Duration: {duration}s</p>
+<h2>Open ports ({len(results.get('open_ports', []))})</h2>
+<table><thead><tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table></body></html>"""
+        def write(path):
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(document)
+        self._atomic_write(filename, write)
         print(f"{GREEN}[+] HTML report saved: {filename}")
 
+    @staticmethod
+    def _csv_safe(value):
+        text_value = str(value if value is not None else "")
+        # Prevent spreadsheet formula execution from untrusted banners or service data.
+        if text_value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+            return "'" + text_value
+        return text_value
+
     def export_csv(self, filename: str):
-        with open(filename, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["Port", "Protocol", "State", "Service", "Banner", "Vulnerabilities"]
-            )
-            for port in self.results:
-                service = port.get("service", "")
-                if isinstance(service, tuple):
-                    service = service if service else ""
-                banner = port.get("banner", "") or "None"
-                vulns = (
-                    "; ".join(
-                        [v["vulnerability"] for v in port.get("vulnerabilities", [])]
-                    )
-                    or "None"
-                )
-                writer.writerow(
-                    [
-                        port["port"],
-                        "tcp",
-                        port["state"],
-                        service,
-                        banner[:50],
-                        vulns,
-                    ]
-                )
+        def write(path):
+            with open(path, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["Port", "Protocol", "State", "Service", "Banner", "Vulnerabilities"])
+                for item in self.results:
+                    service = item.get("service", "")
+                    if isinstance(service, tuple):
+                        service = service if service else ""
+                    banner = item.get("banner", "") or "None"
+                    vulnerabilities = "; ".join(
+                        str(v.get("vulnerability", "")) for v in item.get("vulnerabilities", [])
+                    ) or "None"
+                    writer.writerow([item.get("port", ""), item.get("protocol", "tcp"),
+                                     self._csv_safe(item.get("state", "")),
+                                     self._csv_safe(service), self._csv_safe(banner[:200]),
+                                     self._csv_safe(vulnerabilities)])
+        self._atomic_write(filename, write)
         print(f"{GREEN}[+] CSV report saved: {filename}")
 
 # ============== Network Scanner ==============
@@ -6479,131 +6462,62 @@ def run_network_port_scan(
     network_target: str,
     scan_kwargs: dict,
 ):
-    """Scan each usable host in a CIDR network."""
-
+    """Scan a bounded CIDR host stream; never materialize the full host list."""
     try:
-        network = ipaddress.ip_network(
-            network_target,
-            strict=False,
-        )
+        network = ipaddress.ip_network(network_target, strict=False)
     except ValueError as exc:
+        console.print(f"[!] Invalid network: {exc}", style="bold red")
+        return []
+
+    usable_count = network.num_addresses
+    if network.version == 4 and network.prefixlen < 31:
+        usable_count -= 2
+    max_hosts = int(scan_kwargs.pop("max_hosts", 4096))
+    if max_hosts < 1:
+        console.print("[!] max_hosts must be positive.", style="bold red")
+        return []
+    if usable_count > max_hosts:
         console.print(
-            f"[!] Invalid network: {exc}",
+            f"[!] Network has {usable_count} addresses, exceeding max_hosts={max_hosts}. "
+            "Narrow the CIDR or explicitly raise the limit.",
             style="bold red",
         )
         return []
 
-    hosts = list(network.hosts())
-
-    if not hosts:
-        console.print(
-            "[!] No usable hosts found.",
-            style="bold red",
-        )
-        return []
-
-    if len(hosts) > 256:
-        proceed = Confirm.ask(
-            f"[!] Network contains {len(hosts)} hosts. Continue?",
-            default=False,
-        )
-        if not proceed:
-            console.print(
-                "[*] Network scan cancelled.",
-                style="yellow",
-            )
-            return []
-
-    console.print(
-        "\n[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-    console.print(
-        f"[bold green][+] Network Scan: {network}[/bold green]"
-    )
-    console.print(
-        f"[cyan][*] Hosts: {len(hosts)}[/cyan]"
-    )
-    console.print(
-        "[bold cyan]"
-        "============================================================"
-        "[/bold cyan]\n"
-    )
-
-    all_results = []
-
-    for index, host in enumerate(hosts, start=1):
-        host_ip = str(host)
-
-        console.print(
-            f"\n[bold yellow]"
-            f"[{index}/{len(hosts)}] Scanning {host_ip}"
-            f"[/bold yellow]"
-        )
-
+    exclusions = []
+    for value in scan_kwargs.pop("exclude_ranges", []):
         try:
-            resolved_ip = resolve_host(host_ip)
+            exclusions.append(ipaddress.ip_network(value, strict=False))
+        except ValueError:
+            console.print(f"[!] Ignoring invalid exclusion range: {value}", style="yellow")
 
-            scanner = PortScanner(
-                host_ip,
-                **scan_kwargs,
-            )
+    if usable_count > 256 and not Confirm.ask(
+        f"[!] Network contains {usable_count} addresses. Continue?", default=False
+    ):
+        console.print("[*] Network scan cancelled.", style="yellow")
+        return []
 
-            scanner.resolved_ip = resolved_ip
+    results = []
+    host_count = sum(1 for host in network.hosts()
+                     if not any(host in excluded for excluded in exclusions))
+    for index, host in enumerate(network.hosts(), start=1):
+        if any(host in excluded for excluded in exclusions):
+            continue
+        host_ip = str(host)
+        console.print(f"\\n[bold yellow][{len(results) + 1}/{host_count}] Scanning {host_ip}[/bold yellow]")
+        try:
+            scanner = PortScanner(host_ip, **scan_kwargs)
+            scanner.resolved_ip = host_ip
             scanner.scan()
-
-            result = scanner.get_results()
-
-            if isinstance(result, dict):
-                all_results.append(result)
-
-            scanner.print_summary()
-
-        except KeyboardInterrupt:
-            console.print(
-                "\n[!] Network scan interrupted.",
-                style="yellow",
-            )
-            break
-
-        except Exception as exc:
-            console.print(
-                f"[!] {host_ip}: {exc}",
-                style="red",
-            )
-
-    total_open = sum(
-        len(result.get("open_ports", []))
-        for result in all_results
-        if isinstance(result, dict)
-    )
-
-    console.print(
-        "\n[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-    console.print(
-        "[bold green][✓] Network scan complete[/bold green]"
-    )
-    console.print(
-        f"[cyan][*] Hosts processed: "
-        f"{len(all_results)}/{len(hosts)}[/cyan]"
-    )
-    console.print(
-        f"[cyan][*] Total open ports: {total_open}[/cyan]"
-    )
-    console.print(
-        "[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-
-    return all_results
+            if scanner.results:
+                results.append({"ip": host_ip, "hostname": reverse_dns(host_ip),
+                                "ports": scanner.results})
+        except (OSError, ValueError) as exc:
+            console.print(f"[!] Host scan failed for {host_ip}: {type(exc).__name__}", style="yellow")
+    return results
 
 
-@guard_interrupt
+
 def run_port_scan_cli():
     """Interactive Port Scan Menu."""
 
