@@ -1,8 +1,10 @@
 """Mocked CVE parsing/correlation tests; no live NVD requests."""
 import unittest
+from unittest import mock
 from unittest.mock import Mock
 
 from modules.vuln_scanner import VulnScanner
+import SpectraScan
 
 
 class TestVulnScanner(unittest.TestCase):
@@ -50,6 +52,29 @@ class TestVulnScanner(unittest.TestCase):
         classification, evidence = scanner._match_evidence({"configurations": []})
         self.assertEqual(classification, "informational")
         self.assertTrue(evidence)
+
+    def test_cli_cve_correlation_uses_vendor_product_version_and_bound(self):
+        fake = mock.MagicMock()
+        fake.check_nvd_api.return_value = [{"id": "CVE-2099-1234", "classification": "potential"}]
+        with mock.patch.object(SpectraScan, "VulnScanner", return_value=fake) as factory:
+            report = SpectraScan.correlate_open_port_cves([
+                {"port": 22, "service": "SSH", "banner": "SSH-2.0-OpenSSH_9.1",
+                 "version_info": {"type": "SSH", "version": "9.1"}},
+                {"port": 2222, "service": "SSH", "banner": "SSH-2.0-OpenSSH_9.1",
+                 "version_info": {"type": "SSH", "version": "9.1"}},
+                {"port": 80, "service": "HTTP", "banner": "HTTP/1.1 nginx/1.24.0",
+                 "version_info": {"type": "HTTP", "version": "1.24.0"}},
+            ], max_lookups=1, api_key="test-key")
+        factory.assert_called_once()
+        self.assertEqual(report["queries_attempted"], 1)
+        self.assertEqual(report["queries_skipped_by_limit"], 1)
+        self.assertEqual(report["findings"][0]["ports"], [22, 2222])
+        self.assertEqual(factory.call_args.kwargs["vendor"], "openbsd")
+        self.assertEqual(factory.call_args.kwargs["product"], "openssh")
+
+    def test_cli_cve_correlation_limit_is_validated(self):
+        with self.assertRaises(ValueError):
+            SpectraScan.correlate_open_port_cves([], max_lookups=21)
 
     def test_rate_limit_returns_structured_error(self):
         session = Mock()
