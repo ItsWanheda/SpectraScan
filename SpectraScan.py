@@ -43,6 +43,7 @@ from modules.async_scanner import AsyncPortScanner
 from modules.report_store import ReportStore, atomic_write_text, atomic_write_json, safe_csv_cell
 from modules.web_enumerator import WebEnumerator
 from modules.brute_forcer import BruteForcer
+from modules.vuln_scanner import VulnScanner
 from modules.smb_enum import SMBEnumerator
 from modules.ldap_enum import LDAPEnumerator
 from modules.dns_zone import DNSZone
@@ -6851,6 +6852,8 @@ def _cli_parser():
     parser.add_argument("--async-concurrency", type=int, default=100, help="Async connections (1-512)")
     parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout (0-120 seconds)")
     parser.add_argument("--vuln-scan", action="store_true", help="Enable built-in service/port vulnerability heuristics")
+    parser.add_argument("--cve-correlate", action="store_true", help="Query NVD for version/CPE correlation on a bounded number of detected services") 
+    parser.add_argument("--max-cve-lookups", type=int, default=3, help="Maximum distinct product/version NVD lookups (1-20)")
     parser.add_argument("--os-detect", action="store_true", help="Record TTL-based OS fingerprint evidence")
     parser.add_argument("--web-enum", action="store_true", help="Enumerate web paths using --wordlist")
     parser.add_argument("--wordlist", help="Wordlist for --web-enum")
@@ -6872,6 +6875,89 @@ def _cli_parser():
     parser.add_argument("--max-targets", type=int, default=1024, help="Hard cap on CIDR address count (1-65536)")
     parser.add_argument("--yes", action="store_true", help="Confirm large scans and port ranges explicitly")
     return parser
+
+
+def correlate_open_port_cves(open_ports, max_lookups=3, api_key=None):
+    """Correlate unique detected service versions with NVD; static matches stay potential."""
+    if isinstance(max_lookups, bool) or not 1 <= int(max_lookups) <= 20:
+        raise ValueError("max_lookups must be between 1 and 20")
+    if api_key is None:
+        api_key = os.environ.get("NVD_API_KEY") or os.environ.get("NVD_API_KEY".replace("_API", ""))
+    known_products = (
+        (("openssh", "openbsd", "openssh"),),
+    )
+    identity_rules = (
+        ("openssh", "openbsd", "openssh"),
+        ("dropbear", "dropbear_ssh_project", "dropbear_ssh"),
+        ("nginx", "f5", "nginx"),
+        ("apache httpd", "apache", "http_server"),
+        ("apache/", "apache", "http_server"),
+        ("mariadb", "mariadb", "mariadb"),
+        ("mysql", "oracle", "mysql"),
+        ("redis", "redis", "redis"),
+        ("vsftpd", "vsftpd_project", "vsftpd"),
+        ("proftpd", "proftpd_project", "proftpd"),
+    )
+    unique = {}
+    for item in open_ports:
+        banner = str(item.get("banner") or "")
+        version_info = item.get("version_info") or {}
+        version = str(version_info.get("version") or "").strip()
+        if not version or version.lower() == "unknown":
+            continue
+        combined = (banner + " " + str(item.get("service") or "") + " " + str(version_info.get("type") or "")).lower()
+        identity = next((rule for rule in identity_rules if rule[0] in combined), None)
+        if identity:
+            _, vendor, product = identity
+        else:
+            service = str(version_info.get("type") or item.get("service") or "").lower()
+            if not service or service == "unknown":
+                continue
+            vendor = ""
+            product = re.sub(r"[^a-z0-9_.-]+", "_", service).strip("_.-")
+            if not product:
+                continue
+        key = (vendor, product, version)
+        unique.setdefault(key, []).append(item)
+
+    findings = []
+    errors = []
+    attempted = 0
+    for (vendor, product, version), ports_for_product in list(unique.items())[:int(max_lookups)]:
+        attempted += 1
+        try:
+            scanner = VulnScanner(
+                product, version, vendor=vendor, product=product,
+                api_key=api_key, timeout=8.0, max_records=100,
+            )
+            matches = scanner.check_nvd_api()
+            for finding in matches:
+                findings.append({
+                    **finding,
+                    "vendor": vendor or None,
+                    "product": product,
+                    "detected_version": version,
+                    "ports": sorted({int(item["port"]) for item in ports_for_product if item.get("port") is not None}),
+                })
+            if scanner.errors:
+                errors.extend({
+                    "vendor": vendor or None, "product": product, "version": version, **error
+                } for error in scanner.errors)
+        except Exception as exc:
+            errors.append({
+                "category": "correlation_error", "vendor": vendor or None,
+                "product": product, "version": version, "message": type(exc).__name__,
+            })
+    skipped = max(0, len(unique) - attempted)
+    return {
+        "source": "NVD",
+        "queries_attempted": attempted,
+        "unique_detected_products": len(unique),
+        "queries_skipped_by_limit": skipped,
+        "findings": findings,
+        "errors": errors,
+        "note": "Version/CPE correlations are static evidence and are not proof that a target is exploitable. Verify patch level and exploit preconditions.",
+    }
 
 
 def _write_cli_report(report, output_path, fmt):
@@ -6920,7 +7006,7 @@ def main(argv: Optional[List[str]] = None):
         port_options = (
             option_was_provided("-p", "--ports", "-T", "--timing", "--timeout",
                                 "--async-scan", "--async-concurrency", "--async-timeout",
-                                "--scan-type", "--vuln-scan", "--os-detect", "--web-enum",
+                                "--scan-type", "--vuln-scan", "--cve-correlate", "--max-cve-lookups", "--os-detect", "--web-enum",
                                 "--max-targets", "--exclude")
         )
         non_port_target = any((args.domain, args.ip, args.email, args.phone, args.image))
@@ -6935,6 +7021,12 @@ def main(argv: Optional[List[str]] = None):
             parser.error("--web-enum and --brute-force must run separately")
         if args.vuln_scan and args.async_scan:
             parser.error("--vuln-scan is not supported by --async-scan yet")
+        if args.cve_correlate and args.async_scan:
+            parser.error("--cve-correlate requires legacy service/version detection; remove --async-scan")
+        if args.cve_correlate and args.max_cve_lookups < 1 or args.max_cve_lookups > 20:
+            parser.error("--max-cve-lookups must be between 1 and 20")
+        if args.max_cve_lookups != 3 and not args.cve_correlate:
+            parser.error("--max-cve-lookups requires --cve-correlate")
         if args.vuln_scan and args.scan_type == "udp":
             parser.error("--vuln-scan is not supported by UDP probes")
         if args.wordlist and not (args.web_enum or args.brute_force):
@@ -7114,6 +7206,8 @@ def main(argv: Optional[List[str]] = None):
             "timing": "custom",
             "ports": ports, "decoys": [], "check_vulns": args.vuln_scan, "rate_limit": 0,
         }
+        if is_network and args.cve_correlate:
+            parser.error("--cve-correlate is restricted to a single host to bound NVD API requests")
         if is_network and (args.web_enum or args.os_detect):
             parser.error("--web-enum and --os-detect require a single host target, not a CIDR network")
         if is_network:
@@ -7155,6 +7249,12 @@ def main(argv: Optional[List[str]] = None):
                 scanner.resolved_ip = resolved_ip
                 scanner.scan()
                 report = scanner.get_results()
+            if args.cve_correlate:
+                report["cve_correlation"] = correlate_open_port_cves(
+                    report.get("open_ports", []),
+                    max_lookups=args.max_cve_lookups,
+                    api_key=os.environ.get("NVD_API_KEY"),
+                )
             if args.os_detect:
                 try:
                     report["os_fingerprint_ttl"] = OSFingerprint.get_ttl(resolved_ip)
