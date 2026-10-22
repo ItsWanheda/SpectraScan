@@ -355,7 +355,7 @@ SpectraScan keeps scan output organized and reusable.
 
 | Requirement | Purpose | Required? |
 |---|---|---|
-| Python 3.9+ | Core runtime | ✅ |
+| Python 3.10+ | Core runtime | ✅ |
 | Root / Administrator | Raw sockets for SYN scans | Only for SYN mode |
 | Tor on `127.0.0.1:9050` | `.onion` operations | Only for onion features |
 | `exiv2` or `exiftool` | Image metadata | Optional |
@@ -738,6 +738,21 @@ CLI usage:
 python SpectraScan.py -t scanme.nmap.org --async-scan
 python SpectraScan.py -t scanme.nmap.org --async-scan --async-concurrency 200 --async-timeout 0.75
 ```
+
+## CLI hardening notes
+
+The one-shot CLI rejects unsupported arguments instead of silently ignoring them. Examples:
+
+```bash
+python SpectraScan.py -t scanme.nmap.org -p 1-1000 -T T3 --scan-type tcp
+python SpectraScan.py -t scanme.nmap.org -p 80,443 -o report.json
+python SpectraScan.py -t 192.168.1.1 --scan-type udp -p 53,161 -o udp-report.json
+python SpectraScan.py -t 192.168.1.0/24 -p common --exclude 192.168.1.10 --yes -o network.json
+python SpectraScan.py -d example.com -o domain.json
+python SpectraScan.py -i 8.8.8.8 -o ip-intelligence.json
+```
+
+CIDR scans have a hard address limit set by --max-targets (default 1024), and scans over 64 addresses require explicit --yes confirmation. Exclusions can be repeated. UDP silence is reported as open|filtered, not confirmed open. Historical reports use SPECTRASCAN_HOME (default ~/.local/share/SpectraScan) and exports use atomic writes. SSH credential checks require known-host trust or a pinned SHA256 fingerprint and never store plaintext passwords.
 
 ## 🛣️ Roadmap
 
