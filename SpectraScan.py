@@ -14,6 +14,8 @@ import random
 import struct
 import os
 import logging
+import math
+import queue
 import ssl
 import subprocess
 import re
@@ -37,6 +39,8 @@ from rich.live import Live
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from modules.async_scanner import AsyncPortScanner
+from modules.report_store import ReportStore, atomic_write_text, atomic_write_json, safe_csv_cell
+import io
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "modules"))
 
@@ -3056,19 +3060,7 @@ def save_json_report(
             exist_ok=True,
         )
 
-    with open(
-        output_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            report,
-            file,
-            indent=2,
-            ensure_ascii=False,
-            default=str,
-        )
-
+    atomic_write_text(output_path, json.dumps(report, indent=2, ensure_ascii=False, default=str) + "\n")
     return output_path
 
 
@@ -4295,65 +4287,61 @@ BOLD = "\033[1m"
 
 # ============== Report Manager ==============
 class ReportManager:
+    """Console report manager backed by the shared atomic report store."""
     def __init__(self):
-        self.report_dir = os.path.expanduser("~/.local/share/SpectraScan")
-        os.makedirs(self.report_dir, exist_ok=True)
+        self.store = ReportStore()
+        self.report_dir = str(self.store.directory)
         self.current_file = None
         self.append_file = False
+        self._buffer: List[str] = []
 
     def save_output(self):
-        # In CLI mode, we might skip auto-prompting if not explicitly asked, 
-        # but we keep the logic for consistency.
-        pass 
+        if not self._buffer:
+            console.print("[yellow]No report output to save.[/yellow]")
+            return None
+        filename = f"SS-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt"
+        path = self.store.save_text(filename, "\n".join(self._buffer) + "\n")
+        console.print(f"[green][+] Report saved: {path}[/green]")
+        return path
 
     def write(self, text):
-        # In CLI mode, we can just print to console directly
-        print(text)
+        value = str(text)
+        self._buffer.append(value)
+        console.print(value, markup=False)
 
     def read_report(self):
-        report_files = [f for f in os.listdir(self.report_dir) if f.startswith('SS-report')]
-        if not report_files:
-            print(f"{RED}No reports found.{RESET}")
+        reports = self.store.list_reports()
+        if not reports:
+            console.print("[yellow]No reports found.[/yellow]")
             return
-        print(f"\n{CYAN}[-] Files in {self.report_dir}:{RESET}")
-        for i, f in enumerate(report_files):
-            print(f"{GREEN}[{i+1}]{RESET} {f}")
-
+        for index, filename in enumerate(reports, 1):
+            console.print(f"{index}. {filename}")
         try:
-            target_num = int(input(f"{CYAN}Enter number to read: {RESET}"))
-            if 1 <= target_num <= len(report_files):
-                file_path = os.path.join(self.report_dir, report_files[target_num-1])
-                print(f"\n{BOLD}{RED}{file_path}{RESET}\n")
-                with open(file_path, 'r') as f:
-                    print(f.read())
-            else:
-                print(f"{RED}Invalid input.{RESET}")
-        except ValueError:
-            print(f"{RED}Invalid input.{RESET}")
+            selection = int(input("Select report number: ").strip())
+            if not 1 <= selection <= len(reports):
+                raise ValueError
+            console.print(self.store.read_text(reports[selection - 1]), markup=False)
+        except (ValueError, OSError, UnicodeError):
+            console.print("[red]Invalid selection or report could not be read.[/red]")
 
     def delete_report(self):
-        report_files = [f for f in os.listdir(self.report_dir) if f.startswith('SS-report')]
-        if not report_files:
-            print(f"{RED}No reports found.{RESET}")
+        reports = self.store.list_reports()
+        if not reports:
+            console.print("[yellow]No reports found.[/yellow]")
             return
-        print(f"\n{CYAN}[-] Files in {self.report_dir}:{RESET}")
-        for i, f in enumerate(report_files):
-            print(f"{GREEN}[{i+1}]{RESET} {f}")
-
+        for index, filename in enumerate(reports, 1):
+            console.print(f"{index}. {filename}")
         try:
-            target_num = int(input(f"{CYAN}Enter number to delete: {RESET}"))
-            if 1 <= target_num <= len(report_files):
-                file_path = os.path.join(self.report_dir, report_files[target_num-1])
-                confirm = input(f"{RED}Delete {file_path}? (y/N): {RESET}").lower()
-                if confirm == 'y':
-                    os.remove(file_path)
-                    print(f"{GREEN}[+] Deleted.{RESET}")
-                else:
-                    print(f"{YELLOW}Cancelled.{RESET}")
-            else:
-                print(f"{RED}Invalid input.{RESET}")
-        except ValueError:
-            print(f"{RED}Invalid input.{RESET}")
+            selection = int(input("Select report number to delete: ").strip())
+            if not 1 <= selection <= len(reports):
+                raise ValueError
+            filename = reports[selection - 1]
+            if Confirm.ask(f"Delete {filename}?", default=False):
+                self.store.delete(filename)
+                console.print("[green][+] Deleted.[/green]")
+        except (ValueError, OSError):
+            console.print("[red]Invalid selection or report could not be deleted.[/red]")
+
 
 # ============== Utility Functions ==============
 def normalize_target(target: str) -> str:
@@ -4961,13 +4949,30 @@ class PingSweep:
                 except:
                     pass
                 return {"ip": str(ip), "alive": False}
+            if net.num_addresses > 4096:
+                raise ValueError(f"Network contains {net.num_addresses} addresses; the ping-sweep hard limit is 4096.")
+            if net.num_addresses > 256 and not Confirm.ask(f"Scan {net.num_addresses} addresses?", default=False):
+                print(f"{YELLOW}[*] Ping sweep cancelled.{RESET}")
+                return hosts
             with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-                futures = [executor.submit(ping_host, ip) for ip in net.hosts()]
-                for future in concurrent.futures.as_completed(futures):
-                    res = future.result()
-                    if res["alive"]:
-                        hosts.append(res)
-                        print(f"{GREEN}[+] Host found: {res['ip']}{RESET}")
+                iterator = iter(net.hosts())
+                pending = set()
+                for _ in range(min(100, net.num_addresses)):
+                    try:
+                        pending.add(executor.submit(ping_host, next(iterator)))
+                    except StopIteration:
+                        break
+                while pending:
+                    done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                    for future in done:
+                        res = future.result()
+                        if res["alive"]:
+                            hosts.append(res)
+                            print(f"{GREEN}[+] Host found: {res['ip']}{RESET}")
+                        try:
+                            pending.add(executor.submit(ping_host, next(iterator)))
+                        except StopIteration:
+                            pass
         except Exception as e:
             print(f"{RED}[-] Error: {e}{RESET}")
         return hosts
@@ -5087,56 +5092,73 @@ class PortScanner:
     def scan_port(self, port: int) -> Dict:
         if self.rate_limiter:
             self.rate_limiter.wait()
+        service_value = COMMON_PORTS.get(port, "unknown")
+        if self.scan_type == "udp":
+            udp_result = UDPScan().scan(self.resolved_ip, port, timeout=self.timeout)
+            service = udp_result.get("service", (service_value, ""))
+            if isinstance(service, tuple):
+                service = service[0] if service else "unknown"
+            return {
+                "port": port, "protocol": "udp", "state": udp_result.get("state", "error"),
+                "service": service, "description": PORT_DESCRIPTIONS.get(port, ""),
+                "banner": "", "response": udp_result.get("response", ""),
+                "error": udp_result.get("error"), "version_info": {"type": "unknown", "version": "unknown"},
+                "vulnerabilities": [],
+            }
+        if self.scan_type == "syn":
+            state = SYNScan().scan(self.resolved_ip, port, timeout=self.timeout)
+            result = {
+                "port": port, "protocol": "tcp", "state": state, "service": service_value,
+                "description": PORT_DESCRIPTIONS.get(port, ""), "banner": "",
+                "version_info": {"type": "unknown", "version": "unknown"}, "vulnerabilities": [],
+            }
+            if state == "open":
+                result["banner"] = grab_banner(self.resolved_ip, port, self.timeout)
+                result["version_info"] = identify_service(result["banner"])
+                if self.check_vulns:
+                    result["vulnerabilities"] = check_vulnerabilities(port, service_value, result["banner"])
+                    self.vulnerabilities.extend(result["vulnerabilities"])
+            return result
         result = {
-            "port": port,
-            "protocol": "tcp",
-            "state": "closed",
-            "service": COMMON_PORTS.get(port, "unknown"),
-            "description": PORT_DESCRIPTIONS.get(port, ""),
-            "banner": "",
-            "version_info": {"type": "unknown", "version": "unknown"},
+            "port": port, "protocol": "tcp", "state": "closed",
+            "service": service_value, "description": PORT_DESCRIPTIONS.get(port, ""),
+            "banner": "", "version_info": {"type": "unknown", "version": "unknown"},
             "vulnerabilities": [],
         }
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.timeout)
-            if self.decoys:
-                decoy = random.choice(self.decoys)
-                try:
-                    sock.bind((decoy, 0))
-                except:
-                    pass
             if sock.connect_ex((self.resolved_ip, port)) == 0:
                 result["state"] = "open"
-                banner = grab_banner(self.resolved_ip, port, self.timeout)
-                result["banner"] = banner
-                result["version_info"] = identify_service(banner)
+                result["banner"] = grab_banner(self.resolved_ip, port, self.timeout)
+                result["version_info"] = identify_service(result["banner"])
                 if self.check_vulns:
-                    vulns = check_vulnerabilities(port, result["service"], banner)
-                    if vulns:
-                        result["vulnerabilities"] = vulns
-                        self.vulnerabilities.extend(vulns)
-            sock.close()
+                    result["vulnerabilities"] = check_vulnerabilities(port, result["service"], result["banner"])
+                    self.vulnerabilities.extend(result["vulnerabilities"])
         except socket.timeout:
             result["state"] = "filtered"
-        except socket.error:
+        except OSError as exc:
             result["state"] = "error"
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            if sock is not None:
+                sock.close()
         return result
 
     def scan(self) -> List[Dict]:
         self.start_time = time.time()
+        self.results = []
+        self.vulnerabilities = []
         print(f"{CYAN}[*] Spectra is scanning...\n")
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.threads
-        ) as executor:
-            futures = {
-                executor.submit(self.scan_port, port): port for port in self.ports
-            }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = {executor.submit(self.scan_port, port): port for port in self.ports}
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
-                if result["state"] == "open":
+                if result["state"] == "open" or (self.scan_type == "udp" and result["state"] == "open|filtered"):
                     self.results.append(result)
                     self._print_result(result)
+        self.results.sort(key=lambda item: item["port"])
         return self.results
 
     def _print_result(self, result: Dict):
@@ -5206,9 +5228,8 @@ class PortScanner:
         }
 
     def export_json(self, filename: str):
-        with open(filename, "w") as f:
-            json.dump(self.get_results(), f, indent=2, default=str)
-        print(f"{GREEN}[+] JSON report saved: {filename}")
+        path = atomic_write_json(filename, self.get_results())
+        print(f"{GREEN}[+] JSON report saved: {path}")
 
     def export_html(self, filename: str):
         results = self.get_results()
@@ -5217,122 +5238,59 @@ class PortScanner:
         resolved_ip = html.escape(str(results.get("resolved_ip", "") or ""))
         timestamp = html.escape(str(results.get("timestamp", "")))
         duration = f"{results.get('duration', 0):.2f}"
-
         parts = [f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>SpectraScan Report - {target}</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-        h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
-        .summary {{ background: #e9ecef; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-        th, td {{ padding: 8px 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background: #007bff; color: white; }}
-        tr:hover {{ background: #f1f1f1; }}
-        .open {{ color: #28a745; font-weight: bold; }}
-        .closed {{ color: #dc3545; }}
-        .filtered {{ color: #ffc107; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>SpectraScan Report</h1>
-        <div class="summary">
-            <p><strong>Target:</strong> {target}</p>
-            <p><strong>Resolved IP:</strong> {resolved_ip}</p>
-            <p><strong>Scan Type:</strong> {scan_type}</p>
-            <p><strong>Timestamp:</strong> {timestamp}</p>
-            <p><strong>Duration:</strong> {duration}s</p>
-            <p><strong>Open Ports:</strong> {len(results.get('open_ports', []))}</p>
-            <p><strong>Vulnerabilities:</strong> {len(results.get('vulnerabilities', []))}</p>
-        </div>
-        <h2>Open Ports</h2>
-        <table>
-            <tr><th>Port</th><th>Service</th><th>State</th><th>Banner</th></tr>"""]
-
+<html><head><meta charset="utf-8"><title>SpectraScan Report - {target}</title>
+<style>body{{font-family:Arial,sans-serif;margin:20px}}table{{width:100%;border-collapse:collapse}}td,th{{padding:8px;border-bottom:1px solid #ddd}}th{{background:#222;color:#fff}}</style>
+</head><body><h1>SpectraScan Report</h1>
+<p><b>Target:</b> {target}</p><p><b>Resolved IP:</b> {resolved_ip}</p>
+<p><b>Scan type:</b> {scan_type}</p><p><b>Timestamp:</b> {timestamp}</p>
+<p><b>Duration:</b> {duration}s</p>
+<h2>Open / responsive ports</h2><table><tr><th>Port</th><th>Protocol</th><th>State</th><th>Service</th><th>Banner</th></tr>"""]
         for port in results.get("open_ports", []):
-            port_num = html.escape(str(port.get("port", "")))
-            service = port.get("service", "")
+            service = port.get("service", "unknown")
             if isinstance(service, tuple):
-                service = service if service else ""
-            service = html.escape(str(service))
-            state = html.escape(str(port.get("state", "")))
-            banner = html.escape((port.get("banner", "") or "N/A")[:50])
-            parts.append(
-                f"<tr><td>{port_num}</td><td>{service}</td>"
-                f"<td class='open'>{state}</td><td>{banner}</td></tr>"
-            )
-
-        parts.append("""        </table>
-    </div>
-</body>
-</html>""")
-
-        with open(filename, "w") as f:
-            f.write("".join(parts))
-        print(f"{GREEN}[+] HTML report saved: {filename}")
+                service = " ".join(str(part) for part in service if part)
+            cells = [port.get("port", ""), port.get("protocol", "tcp"), port.get("state", ""), service, (port.get("banner", "") or "")[:300]]
+            parts.append("<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in cells) + "</tr>")
+        parts.append("</table></body></html>")
+        path = atomic_write_text(filename, "".join(parts))
+        print(f"{GREEN}[+] HTML report saved: {path}")
 
     def export_csv(self, filename: str):
-        with open(filename, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ["Port", "Protocol", "State", "Service", "Banner", "Vulnerabilities"]
-            )
-            for port in self.results:
-                service = port.get("service", "")
-                if isinstance(service, tuple):
-                    service = service if service else ""
-                banner = port.get("banner", "") or "None"
-                vulns = (
-                    "; ".join(
-                        [v["vulnerability"] for v in port.get("vulnerabilities", [])]
-                    )
-                    or "None"
-                )
-                writer.writerow(
-                    [
-                        port["port"],
-                        "tcp",
-                        port["state"],
-                        service,
-                        banner[:50],
-                        vulns,
-                    ]
-                )
-        print(f"{GREEN}[+] CSV report saved: {filename}")
+        stream = io.StringIO(newline="")
+        writer = csv.writer(stream)
+        writer.writerow(["Port", "Protocol", "State", "Service", "Banner", "Vulnerabilities"])
+        for port in self.results:
+            service = port.get("service", "")
+            if isinstance(service, tuple):
+                service = " ".join(str(part) for part in service if part)
+            vulns = "; ".join(str(v.get("vulnerability", "")) for v in port.get("vulnerabilities", [])) or "None"
+            writer.writerow([
+                safe_csv_cell(port.get("port", "")), safe_csv_cell(port.get("protocol", "tcp")),
+                safe_csv_cell(port.get("state", "")), safe_csv_cell(service),
+                safe_csv_cell((port.get("banner", "") or "")[:500]), safe_csv_cell(vulns),
+            ])
+        path = atomic_write_text(filename, stream.getvalue())
+        print(f"{GREEN}[+] CSV report saved: {path}")
 
 # ============== Network Scanner ==============
 class NetworkScanner:
     @staticmethod
     def scan_network(network: str, ports: List[int] = None, **kwargs) -> List[Dict]:
-        try:
-            net = ipaddress.ip_network(network, strict=False)
-            print(f"{CYAN}[*] Spectra is Scanning network: {network}")
-            print(f"[*] Hosts: {net.num_addresses - 2}")
-            results = []
-            for ip in net.hosts():
-                ip_str = str(ip)
-                scanner = PortScanner(
-                    ip_str, ports=ports or list(COMMON_PORTS.keys()), **kwargs
-                )
-                scanner.resolved_ip = ip_str
-                scanner.scan()
-                if scanner.results:
-                    results.append(
-                        {
-                            "ip": ip_str,
-                            "hostname": reverse_dns(ip_str),
-                            "ports": scanner.results,
-                        }
-                    )
-                    print(f"{GREEN}[+] {ip_str}: {len(scanner.results)} open ports")
-            return results
-        except ValueError as e:
-            print(f"{RED}[-] Invalid network: {e}")
-            return []
+        max_targets = int(kwargs.pop("max_targets", 1024))
+        exclusions = kwargs.pop("exclusions", None)
+        host_workers = int(kwargs.pop("host_workers", 4))
+        confirmed = bool(kwargs.pop("large_scan_confirmed", False))
+        rows = run_network_port_scan(
+            network, {"ports": ports or list(COMMON_PORTS.keys()), **kwargs},
+            exclusions=exclusions, max_targets=max_targets,
+            host_workers=host_workers, large_scan_confirmed=confirmed,
+        )
+        return [
+            {"ip": row["ip"], "hostname": reverse_dns(row["ip"]), "ports": row["ports"]}
+            for row in rows
+        ]
+
 
 # ============== Protocol Module Scanner ==============
 class ProtocolModuleScanner:
@@ -6474,131 +6432,87 @@ def parse_ports(ports_input: str):
  
  
 def run_network_port_scan(
-    network_target: str,
-    scan_kwargs: dict,
+    network_target: str, scan_kwargs: dict, exclusions=None,
+    max_targets: int = 1024, host_workers: int = 4,
+    large_scan_confirmed: bool = False,
 ):
-    """Scan each usable host in a CIDR network."""
-
+    """Scan a bounded CIDR using a producer thread and fixed worker pool."""
     try:
-        network = ipaddress.ip_network(
-            network_target,
-            strict=False,
-        )
+        network = ipaddress.ip_network(network_target, strict=False)
     except ValueError as exc:
-        console.print(
-            f"[!] Invalid network: {exc}",
-            style="bold red",
-        )
-        return []
-
-    hosts = list(network.hosts())
-
-    if not hosts:
-        console.print(
-            "[!] No usable hosts found.",
-            style="bold red",
-        )
-        return []
-
-    if len(hosts) > 256:
-        proceed = Confirm.ask(
-            f"[!] Network contains {len(hosts)} hosts. Continue?",
-            default=False,
-        )
-        if not proceed:
-            console.print(
-                "[*] Network scan cancelled.",
-                style="yellow",
-            )
-            return []
-
-    console.print(
-        "\n[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-    console.print(
-        f"[bold green][+] Network Scan: {network}[/bold green]"
-    )
-    console.print(
-        f"[cyan][*] Hosts: {len(hosts)}[/cyan]"
-    )
-    console.print(
-        "[bold cyan]"
-        "============================================================"
-        "[/bold cyan]\n"
-    )
-
-    all_results = []
-
-    for index, host in enumerate(hosts, start=1):
-        host_ip = str(host)
-
-        console.print(
-            f"\n[bold yellow]"
-            f"[{index}/{len(hosts)}] Scanning {host_ip}"
-            f"[/bold yellow]"
-        )
-
+        raise ValueError(f"Invalid network: {exc}") from exc
+    if isinstance(max_targets, bool) or not 1 <= int(max_targets) <= 65536:
+        raise ValueError("max_targets must be between 1 and 65536")
+    if isinstance(host_workers, bool) or not 1 <= int(host_workers) <= 16:
+        raise ValueError("host_workers must be between 1 and 16")
+    if network.num_addresses > int(max_targets):
+        raise ValueError(f"Network contains {network.num_addresses} addresses; configured maximum is {max_targets}.")
+    if network.num_addresses > 64 and not large_scan_confirmed:
+        raise ValueError("Large network scan requires explicit confirmation (--yes).")
+    excluded_networks = []
+    for value in exclusions or []:
         try:
-            resolved_ip = resolve_host(host_ip)
+            excluded_networks.append(ipaddress.ip_network(value, strict=False))
+        except ValueError as exc:
+            raise ValueError(f"Invalid exclusion network: {value}") from exc
+    for excluded in excluded_networks:
+        if excluded.version != network.version:
+            raise ValueError(f"Exclusion {excluded} uses a different IP version from {network}.")
+    work_queue = queue.Queue(maxsize=max(2, host_workers * 2))
+    sentinel = object()
+    results = []
+    errors = []
+    result_lock = threading.Lock()
 
-            scanner = PortScanner(
-                host_ip,
-                **scan_kwargs,
-            )
-
-            scanner.resolved_ip = resolved_ip
-            scanner.scan()
-
-            result = scanner.get_results()
-
-            if isinstance(result, dict):
-                all_results.append(result)
-
-            scanner.print_summary()
-
-        except KeyboardInterrupt:
-            console.print(
-                "\n[!] Network scan interrupted.",
-                style="yellow",
-            )
-            break
-
+    def producer():
+        try:
+            for address in network.hosts():
+                if any(address in excluded for excluded in excluded_networks):
+                    continue
+                work_queue.put(str(address))
         except Exception as exc:
-            console.print(
-                f"[!] {host_ip}: {exc}",
-                style="red",
-            )
+            errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            for _ in range(host_workers):
+                work_queue.put(sentinel)
 
-    total_open = sum(
-        len(result.get("open_ports", []))
-        for result in all_results
-        if isinstance(result, dict)
-    )
+    def worker():
+        while True:
+            item = work_queue.get()
+            try:
+                if item is sentinel:
+                    return
+                ip_text = str(item)
+                try:
+                    scanner = PortScanner(ip_text, **scan_kwargs)
+                    scanner.resolved_ip = ip_text
+                    scanner.scan()
+                    if scanner.results:
+                        with result_lock:
+                            results.append({"ip": ip_text, "ports": scanner.results})
+                        print(f"{GREEN}[+] {ip_text}: {len(scanner.results)} responsive ports")
+                except Exception as exc:
+                    with result_lock:
+                        errors.append(f"{ip_text}: {type(exc).__name__}")
+            finally:
+                work_queue.task_done()
 
-    console.print(
-        "\n[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-    console.print(
-        "[bold green][✓] Network scan complete[/bold green]"
-    )
-    console.print(
-        f"[cyan][*] Hosts processed: "
-        f"{len(all_results)}/{len(hosts)}[/cyan]"
-    )
-    console.print(
-        f"[cyan][*] Total open ports: {total_open}[/cyan]"
-    )
-    console.print(
-        "[bold cyan]"
-        "============================================================"
-        "[/bold cyan]"
-    )
-
-    return all_results
+    workers = [
+        threading.Thread(target=worker, name=f"spectrascan-host-{i}", daemon=True)
+        for i in range(host_workers)
+    ]
+    for thread in workers:
+        thread.start()
+    producer_thread = threading.Thread(target=producer, name="spectrascan-host-producer", daemon=True)
+    producer_thread.start()
+    producer_thread.join()
+    work_queue.join()
+    for thread in workers:
+        thread.join()
+    if errors:
+        console.print(f"[yellow][!] {len(errors)} host scan error(s) occurred.[/yellow]")
+    results.sort(key=lambda item: ipaddress.ip_address(item["ip"]))
+    return results
 
 
 @guard_interrupt
