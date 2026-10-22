@@ -68,7 +68,7 @@ class BruteForcer:
                     "username": str(outcome.get("username", "")),
                     "category": "authenticated",
                 })
-            elif outcome.get("status") == "error":
+            elif outcome.get("status") in {"error", "failed"}:
                 self.error_counts[category] += 1
 
     def check_ssh(self, username: str, password: str) -> Dict[str, Any]:
@@ -78,10 +78,13 @@ class BruteForcer:
             return {"status": "error", "category": "dependency_missing"}
         client = paramiko.SSHClient()
         try:
-            client.load_system_host_keys()
-            if self.known_hosts_path:
-                client.load_host_keys(str(Path(self.known_hosts_path).expanduser()))
             expected = (self.expected_host_fingerprint or "").strip()
+            # In fingerprint-pinning mode do not load existing known-host keys:
+            # Paramiko would accept a known key before invoking MissingHostKeyPolicy.
+            if not expected:
+                client.load_system_host_keys()
+                if self.known_hosts_path:
+                    client.load_host_keys(str(Path(self.known_hosts_path).expanduser()))
             if expected:
                 class PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
                     def missing_host_key(policy_self, ssh_client, hostname, key):
