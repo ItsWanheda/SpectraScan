@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import ssl
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
