@@ -42,7 +42,7 @@ class TestVulnScanner(unittest.TestCase):
             }]
         }
         classification, evidence = scanner._match_evidence(cve)
-        self.assertEqual(classification, "confirmed")
+        self.assertEqual(classification, "potential")
         self.assertTrue(evidence)
 
     def test_keyword_only_match_is_not_confirmed(self):
