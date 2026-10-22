@@ -6882,14 +6882,11 @@ def correlate_open_port_cves(open_ports, max_lookups=3, api_key=None):
     if isinstance(max_lookups, bool) or not 1 <= int(max_lookups) <= 20:
         raise ValueError("max_lookups must be between 1 and 20")
     if api_key is None:
-        api_key = os.environ.get("NVD_API_KEY") or os.environ.get("NVD_API_KEY".replace("_API", ""))
-    known_products = (
-        (("openssh", "openbsd", "openssh"),),
-    )
+        api_key = os.environ.get("NVD_API_KEY")
     identity_rules = (
         ("openssh", "openbsd", "openssh"),
         ("dropbear", "dropbear_ssh_project", "dropbear_ssh"),
-        ("nginx", "f5", "nginx"),
+        ("nginx", "nginx", "nginx"),
         ("apache httpd", "apache", "http_server"),
         ("apache/", "apache", "http_server"),
         ("mariadb", "mariadb", "mariadb"),
@@ -7023,7 +7020,7 @@ def main(argv: Optional[List[str]] = None):
             parser.error("--vuln-scan is not supported by --async-scan yet")
         if args.cve_correlate and args.async_scan:
             parser.error("--cve-correlate requires legacy service/version detection; remove --async-scan")
-        if args.cve_correlate and args.max_cve_lookups < 1 or args.max_cve_lookups > 20:
+        if not 1 <= args.max_cve_lookups <= 20:
             parser.error("--max-cve-lookups must be between 1 and 20")
         if args.max_cve_lookups != 3 and not args.cve_correlate:
             parser.error("--max-cve-lookups requires --cve-correlate")
