@@ -42,6 +42,10 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from modules.async_scanner import AsyncPortScanner
 from modules.report_store import ReportStore, atomic_write_text, atomic_write_json, safe_csv_cell
 from modules.web_enumerator import WebEnumerator
+from modules.brute_forcer import BruteForcer
+from modules.smb_enum import SMBEnumerator
+from modules.ldap_enum import LDAPEnumerator
+from modules.dns_zone import DNSZone
 import io
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "modules"))
@@ -6166,7 +6170,7 @@ class DomainScanner:
 class IPScanner:
     """Integrates SpectraScan IP Scanner features"""
     @staticmethod
-    def scan(ip: str, report_manager: ReportManager):
+    def scan(ip: str, report_manager: ReportManager, include_shodan: Optional[bool] = None):
         report_manager.write(f"\n-----IP SCAN OF {ip}-----\n")
 
         # GeoIP
@@ -6188,29 +6192,33 @@ class IPScanner:
         report_manager.write("\n[*] ADMIN INFO (WHOIS)")
         report_manager.write(DomainScanner._run_whois(ip))
 
-        # Shodan
-        report_manager.write("\n[*] SHODAN RESULTS")
-        api_key = os.environ.get("SHODAN_API_KEY")
-        if not api_key:
-            report_manager.write("[-] SHODAN_API_KEY environment variable not set. Skipping Shodan lookup.")
+        # Shodan: optional in one-shot CLI mode, legacy auto mode in interactive menu.
+        if include_shodan is False:
+            report_manager.write("\n[*] SHODAN RESULTS")
+            report_manager.write("[*] Shodan lookup disabled. Pass --shodan to request enrichment.")
         else:
-            try:
-                import shodan
-                api = shodan.Shodan(api_key)
-                result = api.host(ip)
-                ports = result.get("ports", [])
-                report_manager.write(f"Open Ports: {len(ports)}")
-                for port in ports:
-                    banner = ""
-                    for entry in result.get("data", []):
-                        if entry.get("port") == port:
-                            banner = entry.get("product", "Unknown")
-                            break
-                    report_manager.write(f"  Port {port}: {banner}")
-            except ImportError:
-                report_manager.write("[-] Shodan Python library not found. Install with: pip install shodan")
-            except Exception as e:
-                report_manager.write(f"Error with Shodan: {e}")
+            report_manager.write("\n[*] SHODAN RESULTS")
+            api_key = os.environ.get("SHODAN_API_KEY")
+            if not api_key:
+                report_manager.write("[-] SHODAN_API_KEY environment variable not set. Skipping Shodan lookup.")
+            else:
+                try:
+                    import shodan
+                    api = shodan.Shodan(api_key)
+                    result = api.host(ip)
+                    ports = result.get("ports", [])
+                    report_manager.write(f"Open Ports: {len(ports)}")
+                    for port in ports:
+                        banner = ""
+                        for entry in result.get("data", []):
+                            if entry.get("port") == port:
+                                banner = entry.get("product", "Unknown")
+                                break
+                        report_manager.write(f"  Port {port}: {banner}")
+                except ImportError:
+                    report_manager.write("[-] Shodan Python library not found. Install with: pip install shodan")
+                except Exception as e:
+                    report_manager.write(f"Error with Shodan: {type(e).__name__}")
 
         report_manager.write("\n[*] DONE")
 
@@ -6229,7 +6237,7 @@ class PhoneScanner:
         if os.path.exists(script_path):
             try:
                 result = subprocess.run(
-                    ["python3", script_path, phone],
+                    [sys.executable, script_path, phone],
                     capture_output=True,
                     text=True,
                     timeout=60,
@@ -6795,6 +6803,9 @@ def _cli_parser():
     targets.add_argument("-t", "--target", help="IP address, hostname, URL, or CIDR network")
     targets.add_argument("-d", "--domain", help="Run passive-first domain intelligence")
     targets.add_argument("-i", "--ip", help="Run IP intelligence")
+    targets.add_argument("-e", "--email", help="Check public email reputation")
+    targets.add_argument("--phone", help="Look up a phone number")
+    targets.add_argument("--image", help="Extract metadata from a local image")
     parser.add_argument("-p", "--ports", default="common", help="Ports: comma list, range (1-1024), common, or all")
     parser.add_argument("-T", "--timing", choices=sorted(TIMING_PROFILES), default="T3", help="Port-scan timing profile")
     parser.add_argument("--scan-type", choices=("tcp", "syn", "udp"), default="tcp", help="Select TCP connect, SYN, or UDP probing")
@@ -6807,6 +6818,17 @@ def _cli_parser():
     parser.add_argument("--os-detect", action="store_true", help="Record TTL-based OS fingerprint evidence")
     parser.add_argument("--web-enum", action="store_true", help="Enumerate web paths using --wordlist")
     parser.add_argument("--wordlist", help="Wordlist for --web-enum")
+    parser.add_argument("-l", "--links", action="store_true", help="Collect links for a domain target")
+    parser.add_argument("--shodan", action="store_true", help="Request Shodan enrichment (requires -i/--ip and SHODAN_API_KEY)")
+    parser.add_argument("--brute-force", action="store_true", help="Run bounded SSH/FTP credential validation against an authorized target")
+    parser.add_argument("--service", choices=("ssh", "ftp"), help="Service for --brute-force")
+    parser.add_argument("--port", type=int, help="Service port for --brute-force")
+    parser.add_argument("--max-attempts", type=int, default=100, help="Maximum passwords from the wordlist (1-1000)")
+    parser.add_argument("--ssh-known-hosts", help="Optional SSH known_hosts file")
+    parser.add_argument("--ssh-host-fingerprint", help="Pin SSH host key using OpenSSH SHA256: fingerprint")
+    parser.add_argument("--smb", action="store_true", help="Run SMB enumeration against --target")
+    parser.add_argument("--ldap", action="store_true", help="Run LDAP enumeration against --target")
+    parser.add_argument("--dns-zone", action="store_true", help="Check DNS zone transfer against --domain")
     parser.add_argument("-o", "--output", help="Write a report to this path")
     parser.add_argument("-f", "--format", choices=("json", "html", "csv"), help="Report format; inferred from output extension if omitted")
     parser.add_argument("--exclude", action="append", default=[], help="Exclude an IP/CIDR from a network scan; repeatable")
@@ -6854,8 +6876,33 @@ def main(argv: Optional[List[str]] = None):
     if argv:
         parser = _cli_parser()
         args = parser.parse_args(argv)
-        if not any((args.target, args.domain, args.ip)):
-            parser.error("choose one target with -t/--target, -d/--domain, or -i/--ip")
+        if not any((args.target, args.domain, args.ip, args.email, args.phone, args.image)):
+            parser.error("choose one target using -t/--target, -d/--domain, -i/--ip, -e/--email, --phone, or --image")
+        if args.shodan and not args.ip:
+            parser.error("--shodan requires -i/--ip")
+        if args.links and not (args.domain or args.target):
+            parser.error("--links requires -d/--domain or -t/--target")
+        if args.dns_zone and not args.domain:
+            parser.error("--dns-zone requires -d/--domain")
+        if (args.smb or args.ldap or args.brute_force) and not args.target:
+            parser.error("--smb, --ldap, and --brute-force require -t/--target")
+        if args.brute_force:
+            if not args.wordlist or not args.service or args.port is None:
+                parser.error("--brute-force requires --wordlist, --service ssh|ftp, and --port")
+            if not args.yes:
+                parser.error("--brute-force requires explicit confirmation with --yes")
+            if not 1 <= args.port <= 65535:
+                parser.error("--port must be between 1 and 65535")
+            if not 1 <= args.max_attempts <= 1000:
+                parser.error("--max-attempts must be between 1 and 1000")
+            if args.service != "ssh" and args.ssh_host_fingerprint:
+                parser.error("--ssh-host-fingerprint is only valid with --service ssh")
+        elif args.service or args.port is not None or args.ssh_known_hosts or args.ssh_host_fingerprint:
+            parser.error("--service, --port, and SSH host-key options require --brute-force")
+        if args.email and not EMAIL_REGEX.fullmatch(args.email):
+            parser.error("--email must be a valid email address")
+        if args.phone and detect_target_type(args.phone).get("type") != "phone":
+            parser.error("--phone must be a phone number in a recognized format")
         if not 1 <= args.max_targets <= 65536:
             parser.error("--max-targets must be between 1 and 65536")
         if not 1 <= args.threads <= 512:
@@ -6878,30 +6925,90 @@ def main(argv: Optional[List[str]] = None):
             parser.error("--format conflicts with output file extension")
 
         manager = ReportManager()
-        if args.domain:
-            report = DomainScanner.scan(args.domain, manager)
-            if report is None:
-                parser.error("domain scan could not validate the requested domain")
+
+        def finish_report(report):
             if args.output:
                 saved = _write_cli_report(report, args.output, args.format)
                 console.print(f"[green][+] Report saved: {saved}[/green]")
+            else:
+                console.print(json.dumps(report, indent=2, ensure_ascii=False, default=str), markup=False)
             return 0
+
+        if args.email:
+            EmailScanner.scan(args.email, manager)
+            return finish_report({
+                "module": "Email Intelligence", "target": args.email,
+                "timestamp": datetime.now().isoformat(), "output": manager._buffer,
+            })
+        if args.phone:
+            PhoneScanner.scan(args.phone, manager)
+            return finish_report({
+                "module": "Phone Intelligence", "target": args.phone,
+                "timestamp": datetime.now().isoformat(), "output": manager._buffer,
+            })
+        if args.image:
+            ImageScanner.scan(args.image, manager)
+            return finish_report({
+                "module": "Image Metadata", "target": args.image,
+                "timestamp": datetime.now().isoformat(), "output": manager._buffer,
+            })
+        if args.domain:
+            domain_report = DomainScanner.scan(args.domain, manager)
+            if domain_report is None:
+                parser.error("domain scan could not validate the requested domain")
+            report = domain_report
+            if args.links:
+                LinkScanner.scan(args.domain, manager)
+                report = {"target": args.domain, "domain_intelligence": domain_report, "link_output": manager._buffer}
+            if args.dns_zone:
+                report = {
+                    "target": args.domain, "domain_intelligence": domain_report,
+                    "dns_zone": DNSZone.scan(args.domain), "output": manager._buffer,
+                }
+            return finish_report(report)
         if args.ip:
             try:
                 ipaddress.ip_address(args.ip)
             except ValueError:
                 parser.error("--ip must be a valid IPv4 or IPv6 address")
-            IPScanner.scan(args.ip, manager)
-            report = {
+            IPScanner.scan(args.ip, manager, include_shodan=args.shodan)
+            return finish_report({
                 "module": "IP Intelligence", "target": args.ip,
+                "shodan_requested": args.shodan,
                 "timestamp": datetime.now().isoformat(), "output": manager._buffer,
-            }
-            if args.output:
-                saved = _write_cli_report(report, args.output, args.format)
-                console.print(f"[green][+] Report saved: {saved}[/green]")
-            return 0
+            })
 
         target = normalize_target(args.target)
+        if args.smb or args.ldap or args.brute_force:
+            if "/" in target:
+                parser.error("protocol enumeration and credential validation require a single host, not a CIDR")
+            try:
+                resolved_ip = resolve_host(target)
+            except (ValueError, socket.gaierror) as exc:
+                parser.error(str(exc))
+            modules = {}
+            if args.smb:
+                modules["smb"] = SMBEnumerator.scan(resolved_ip)
+            if args.ldap:
+                modules["ldap"] = LDAPEnumerator.scan(resolved_ip)
+            if args.brute_force:
+                brute = BruteForcer(
+                    resolved_ip, args.port, args.service, args.wordlist,
+                    max_threads=min(args.threads, 32),
+                    known_hosts_path=args.ssh_known_hosts,
+                    expected_host_fingerprint=args.ssh_host_fingerprint,
+                    max_passwords=args.max_attempts,
+                )
+                modules["credential_validation"] = {
+                    "target": resolved_ip, "port": args.port, "service": args.service,
+                    "passwords_checked_per_username": len(brute.load_wordlist()),
+                    "results": brute.run(),
+                    "error_counts": dict(brute.error_counts),
+                }
+            return finish_report({
+                "target": target, "resolved_ip": resolved_ip, "modules": modules,
+                "timestamp": datetime.now().isoformat(),
+            })
         if not target:
             parser.error("target cannot be empty")
         try:
@@ -6910,6 +7017,12 @@ def main(argv: Optional[List[str]] = None):
         except ValueError:
             network = None
             is_network = False
+        if args.links:
+            parser.error("--links is supported with --domain; use -d/--domain")
+        if args.shodan or args.dns_zone or args.smb or args.ldap or args.brute_force:
+            parser.error("the selected module option is incompatible with this scan")
+        if args.phone or args.image or args.email:
+            parser.error("OSINT options cannot be combined with a port scan")
         if args.scan_type == "udp" and args.ports.strip().lower() == "common":
             ports = sorted(UDPScan().common_udp_ports)
         else:
