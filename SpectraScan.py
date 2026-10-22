@@ -6784,47 +6784,203 @@ def print_main_menu():
     console.print("[bold red]4.[/bold red] Exit")
  
  
-def main():
-    # Legacy CLI args for backward compatibility / scripting
-    if len(sys.argv) > 1:
-        parser = argparse.ArgumentParser(description="SpectraScan Legacy CLI")
-        parser.add_argument("-t", "--target", help="Target")
-        parser.add_argument("-d", "--domain", help="Domain")
-        parser.add_argument("-i", "--ip", help="IP")
-        parser.add_argument("--async-scan", action="store_true", help="Use the asyncio/aiohttp scanner engine for TCP scans")
-        parser.add_argument("--async-concurrency", type=int, default=100, help="Maximum concurrent async connections (default: 100)")
-        parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout in seconds (default: 1.0)")
-        args, _ = parser.parse_known_args()
+def _cli_parser():
+    parser = argparse.ArgumentParser(
+        description="SpectraScan — authorized network reconnaissance and reporting",
+        allow_abbrev=False,
+    )
+    targets = parser.add_mutually_exclusive_group(required=False)
+    targets.add_argument("-t", "--target", help="IP address, hostname, URL, or CIDR network")
+    targets.add_argument("-d", "--domain", help="Run passive-first domain intelligence")
+    targets.add_argument("-i", "--ip", help="Run IP intelligence")
+    parser.add_argument("-p", "--ports", default="common", help="Ports: comma list, range (1-1024), common, or all")
+    parser.add_argument("-T", "--timing", choices=sorted(TIMING_PROFILES), default="T3", help="Port-scan timing profile")
+    parser.add_argument("--scan-type", choices=("tcp", "syn", "udp"), default="tcp", help="Select TCP connect, SYN, or UDP probing")
+    parser.add_argument("--timeout", type=float, default=None, help="Override connection timeout in seconds")
+    parser.add_argument("--threads", type=int, default=100, help="Port worker count (1-512)")
+    parser.add_argument("--async-scan", action="store_true", help="Use the bounded asyncio TCP scanner")
+    parser.add_argument("--async-concurrency", type=int, default=100, help="Async connections (1-512)")
+    parser.add_argument("--async-timeout", type=float, default=1.0, help="Async connection timeout (0-120 seconds)")
+    parser.add_argument("--vuln-scan", action="store_true", help="Enable built-in service/port vulnerability heuristics")
+    parser.add_argument("--os-detect", action="store_true", help="Record TTL-based OS fingerprint evidence")
+    parser.add_argument("--web-enum", action="store_true", help="Enumerate web paths using --wordlist")
+    parser.add_argument("--wordlist", help="Wordlist for --web-enum")
+    parser.add_argument("-o", "--output", help="Write a report to this path")
+    parser.add_argument("-f", "--format", choices=("json", "html", "csv"), help="Report format; inferred from output extension if omitted")
+    parser.add_argument("--exclude", action="append", default=[], help="Exclude an IP/CIDR from a network scan; repeatable")
+    parser.add_argument("--max-targets", type=int, default=1024, help="Hard cap on CIDR address count (1-65536)")
+    parser.add_argument("--yes", action="store_true", help="Confirm large scans and port ranges explicitly")
+    return parser
 
-        if args.target:
+
+def _write_cli_report(report, output_path, fmt):
+    fmt = fmt or os.path.splitext(output_path)[1].lstrip(".").lower()
+    if fmt == "json":
+        return atomic_write_json(output_path, report)
+    if fmt == "html":
+        pretty = html.escape(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+        document = "<!doctype html><html><head><meta charset=\"utf-8\"><title>SpectraScan Report</title></head><body><h1>SpectraScan Report</h1><pre>" + pretty + "</pre></body></html>"
+        return atomic_write_text(output_path, document)
+    if fmt != "csv":
+        raise ValueError("Report format must be json, html, or csv")
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream)
+    writer.writerow(["Target", "Port", "Protocol", "State", "Service", "Banner", "Classification"])
+    rows = list(report.get("open_ports", []))
+    for host in report.get("hosts", []):
+        for port in host.get("ports", []):
+            rows.append({"target": host.get("ip"), **port})
+    for item in rows:
+        service = item.get("service", "")
+        if isinstance(service, tuple):
+            service = " ".join(str(part) for part in service if part)
+        writer.writerow([
+            safe_csv_cell(item.get("target", report.get("target", ""))),
+            safe_csv_cell(item.get("port", "")),
+            safe_csv_cell(item.get("protocol", report.get("scan_type", "tcp"))),
+            safe_csv_cell(item.get("state", "")), safe_csv_cell(service),
+            safe_csv_cell((item.get("banner", "") or "")[:500]),
+            safe_csv_cell(item.get("classification", "")),
+        ])
+    return atomic_write_text(output_path, stream.getvalue())
+
+
+def main(argv: Optional[List[str]] = None):
+    if argv is None:
+        argv = sys.argv[1:]
+    # Keep the interactive menu for an argument-free launch.
+    if argv:
+        parser = _cli_parser()
+        args = parser.parse_args(argv)
+        if not any((args.target, args.domain, args.ip)):
+            parser.error("choose one target with -t/--target, -d/--domain, or -i/--ip")
+        if not 1 <= args.max_targets <= 65536:
+            parser.error("--max-targets must be between 1 and 65536")
+        if not 1 <= args.threads <= 512:
+            parser.error("--threads must be between 1 and 512")
+        if args.timeout is not None and (not math.isfinite(args.timeout) or not 0 < args.timeout <= 120):
+            parser.error("--timeout must be greater than 0 and at most 120 seconds")
+        if args.async_scan and args.scan_type != "tcp":
+            parser.error("--async-scan supports only --scan-type tcp")
+        if args.async_scan and args.timeout is not None:
+            parser.error("use --async-timeout with --async-scan instead of --timeout")
+        if args.web_enum and not args.wordlist:
+            parser.error("--web-enum requires --wordlist")
+        if args.format and not args.output:
+            parser.error("--format requires --output")
+        if args.output and not args.format and os.path.splitext(args.output)[1].lower() not in {".json", ".html", ".csv"}:
+            parser.error("cannot infer report format; specify --format json|html|csv")
+        if args.output and args.format and os.path.splitext(args.output)[1] and os.path.splitext(args.output)[1].lower() != "." + args.format:
+            parser.error("--format conflicts with output file extension")
+
+        manager = ReportManager()
+        if args.domain:
+            report = DomainScanner.scan(args.domain, manager)
+            if report is None:
+                parser.error("domain scan could not validate the requested domain")
+            if args.output:
+                saved = _write_cli_report(report, args.output, args.format or "json")
+                console.print(f"[green][+] Report saved: {saved}[/green]")
+            return 0
+        if args.ip:
             try:
-                target = normalize_target(args.target)
+                ipaddress.ip_address(args.ip)
+            except ValueError:
+                parser.error("--ip must be a valid IPv4 or IPv6 address")
+            IPScanner.scan(args.ip, manager)
+            report = {
+                "module": "IP Intelligence", "target": args.ip,
+                "timestamp": datetime.now().isoformat(), "output": manager._buffer,
+            }
+            if args.output:
+                saved = _write_cli_report(report, args.output, args.format or "json")
+                console.print(f"[green][+] Report saved: {saved}[/green]")
+            return 0
+
+        target = normalize_target(args.target)
+        if not target:
+            parser.error("target cannot be empty")
+        try:
+            network = ipaddress.ip_network(target, strict=False)
+            is_network = "/" in target
+        except ValueError:
+            network = None
+            is_network = False
+        if args.scan_type == "udp" and args.ports.strip().lower() == "common":
+            ports = sorted(UDPScan().common_udp_ports)
+        else:
+            ports = parse_ports(args.ports)
+        if ports is None:
+            parser.error(f"invalid --ports value: {args.ports!r}; use comma-separated ports, ranges, common, or all")
+        if len(ports) > 5000 and not args.yes:
+            parser.error("large port ranges require explicit confirmation; add --yes")
+        if args.async_scan:
+            if not 1 <= args.async_concurrency <= 512:
+                parser.error("--async-concurrency must be between 1 and 512")
+            if not math.isfinite(args.async_timeout) or not 0 < args.async_timeout <= 120:
+                parser.error("--async-timeout must be greater than 0 and at most 120 seconds")
+            if len(ports) > 10000 and not args.yes:
+                parser.error("async scans over 10000 ports require --yes")
+
+        scan_kwargs = {
+            "timeout": args.timeout if args.timeout is not None else 1.0,
+            "threads": args.threads,
+            "scan_type": args.scan_type,
+            "timing": "custom" if args.timeout is not None else args.timing,
+            "ports": ports, "decoys": [], "check_vulns": args.vuln_scan, "rate_limit": 0,
+        }
+        if is_network:
+            if network.version != 4:
+                parser.error("CIDR port sweeps currently support IPv4 only; use a single IPv6 target")
+            if network.num_addresses > args.max_targets:
+                parser.error(f"network has {network.num_addresses} addresses, exceeding --max-targets={args.max_targets}")
+            if network.num_addresses > 64 and not args.yes:
+                parser.error("large network scan requires explicit confirmation; add --yes")
+            results = run_network_port_scan(
+                str(network), scan_kwargs, exclusions=args.exclude,
+                max_targets=args.max_targets, large_scan_confirmed=args.yes,
+            )
+            report = {
+                "target": str(network), "scan_type": args.scan_type,
+                "timestamp": datetime.now().isoformat(), "hosts": results, "open_ports": [],
+            }
+        else:
+            try:
                 resolved_ip = resolve_host(target)
-
-                if args.async_scan:
-                    scanner = AsyncPortScanner(target, ports=list(COMMON_PORTS.keys()), timeout=args.async_timeout, concurrency=args.async_concurrency)
-                    scanner.resolved_ip = resolved_ip
-                    asyncio.run(scanner.scan_async())
-                    result = scanner.get_results()
-                    console.print(f"[green][✓] Async scan completed in {result['duration']:.2f}s — {len(result['open_ports'])} open ports[/green]")
-                    for item in sorted(result["open_ports"], key=lambda value: value["port"]):
-                        console.print(f"[green][+] {item['port']}/tcp {item.get('service', 'unknown')} {item.get('banner', '')[:80]}[/green]")
-                else:
-                    scanner = PortScanner(target)
-                    scanner.resolved_ip = resolved_ip
-                    scanner.scan()
-                    scanner.print_summary()
-            except Exception as exc:
-                console.print(
-                    f"[!] Scan failed: {exc}",
-                    style="bold red",
+            except (ValueError, socket.gaierror) as exc:
+                parser.error(str(exc))
+            if args.async_scan:
+                scanner = AsyncPortScanner(
+                    target, ports=ports, timeout=args.async_timeout,
+                    concurrency=args.async_concurrency,
                 )
-                sys.exit(1)
+                try:
+                    scanner.scan()
+                    report = scanner.get_results()
+                except (ValueError, OSError, asyncio.TimeoutError) as exc:
+                    parser.error(f"async scan failed: {exc}")
+            else:
+                scanner = PortScanner(target, **scan_kwargs)
+                scanner.resolved_ip = resolved_ip
+                scanner.scan()
+                report = scanner.get_results()
+            if args.os_detect:
+                try:
+                    report["os_fingerprint_ttl"] = OSFingerprint.get_ttl(resolved_ip)
+                    report["os_fingerprint_note"] = "TTL heuristic only; not definitive OS identification."
+                except Exception:
+                    report["os_fingerprint_ttl"] = None
+            if args.web_enum:
+                base_url = target if target.lower().startswith(("http://", "https://")) else "http://" + target
+                report["web_enumeration"] = WebEnumerator(base_url, args.wordlist).run()
+        if args.output:
+            saved = _write_cli_report(report, args.output, args.format or "json")
+            console.print(f"[green][+] Report saved: {saved}[/green]")
+        elif args.scan_type == "udp":
+            console.print("[yellow]UDP silence is reported as open|filtered; it is not proof of an open port.[/yellow]")
+        return 0
 
-            return
- 
     print_banner()
-    
     while True:
         print_main_menu()
         try:
@@ -6832,7 +6988,6 @@ def main():
         except (KeyboardInterrupt, EOFError):
             console.print("\n[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
             break
- 
         if choice == "4":
             console.print("[*] Exiting SpectraScan. Stay Anonymous.", style="yellow")
             break
@@ -6840,7 +6995,8 @@ def main():
             MENU_ACTIONS[choice][1]()
         else:
             console.print("[!] Invalid Option. Please try again.", style="red")
- 
- 
+    return 0
+
+
 if __name__ == "__main__":
     main()
