@@ -6818,8 +6818,8 @@ def main():
     parser.add_argument("--scan-type", choices=("tcp", "udp"), default="tcp",
                         help="Scan protocol (default: tcp)")
     parser.add_argument("--timing", choices=tuple(TIMING_PROFILES), default="T3")
-    parser.add_argument("--timeout", type=float, default=1.0)
-    parser.add_argument("--threads", type=int, default=100)
+    parser.add_argument("--timeout", type=float, default=None)
+    parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--output", help="Report output path")
     parser.add_argument("--format", choices=("json", "html", "csv"),
                         help="Report format; inferred from --output extension if omitted")
@@ -6853,9 +6853,11 @@ def main():
     ports = parse_ports(args.ports)
     if ports is None:
         parser.error(f"invalid --ports value: {args.ports!r}")
-    if not 0 < args.timeout <= 60:
+    timeout = args.timeout if args.timeout is not None else TIMING_PROFILES[args.timing]["timeout"]
+    threads = args.threads if args.threads is not None else TIMING_PROFILES[args.timing]["threads"]
+    if not 0 < timeout <= 60:
         parser.error("--timeout must be between 0 and 60 seconds")
-    if not 1 <= args.threads <= 512:
+    if not 1 <= threads <= 512:
         parser.error("--threads must be between 1 and 512")
     if not 1 <= args.async_concurrency <= 512:
         parser.error("--async-concurrency must be between 1 and 512")
@@ -6870,10 +6872,10 @@ def main():
         if args.scan_type == "udp":
             if args.async_scan:
                 parser.error("UDP is not supported by --async-scan")
-            scanner = PortScanner(target, ports=ports, scan_type="udp", timeout=args.timeout,
-                                  threads=args.threads, timing=args.timing)
+            scanner = PortScanner(target, ports=ports, scan_type="udp", timeout=timeout,
+                                  threads=threads, timing=args.timing)
             scanner.resolved_ip = resolved_ip
-            scanner.results = _udp_scan(target, ports, args.timeout)
+            scanner.results = _udp_scan(target, ports, timeout)
             scanner.start_time = time.time()
             console.print(f"[green][+] UDP probe complete; {len(scanner.results)} responding ports[/green]")
         elif args.async_scan:
