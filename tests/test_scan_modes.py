@@ -38,7 +38,7 @@ class TestScanModes(unittest.TestCase):
             "127.0.0.1", ports=list(range(1, 501)), timing="custom", threads=4
         )
         calls = []
-        def fake_probe(port):
+        def fake_probe(_scanner, port):
             calls.append(port)
             return {"port": port, "protocol": "tcp", "state": "closed", "service": "unknown", "banner": "", "vulnerabilities": []}
         with patch.object(SpectraScan.PortScanner, "scan_port", fake_probe):
