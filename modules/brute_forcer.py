@@ -40,13 +40,13 @@ class BruteForcer:
             raise ValueError("port must be in the range 1..65535")
         if self.service not in {"ssh", "ftp"}:
             raise ValueError("service must be 'ssh' or 'ftp'")
-        if self.expected_host_fingerprint and not self.expected_host_fingerprint.startswith("SHA256:"):
-            raise ValueError("expected_host_fingerprint must use the OpenSSH SHA256: format")
         if isinstance(max_threads, bool) or not 1 <= int(max_threads) <= 32:
             raise ValueError("max_threads must be between 1 and 32")
         self.max_threads = int(max_threads)
         self.known_hosts_path = known_hosts_path
         self.expected_host_fingerprint = expected_host_fingerprint
+        if self.expected_host_fingerprint and not self.expected_host_fingerprint.startswith("SHA256:"):
+            raise ValueError("expected_host_fingerprint must use the OpenSSH SHA256: format")
         self.results: list[Dict[str, Any]] = []
         self.error_counts: Counter[str] = Counter()
         self.lock = threading.Lock()
@@ -151,6 +151,8 @@ class BruteForcer:
                     pass
 
     def run(self) -> list[Dict[str, Any]]:
+        self.results = []
+        self.error_counts.clear()
         wordlist = self.load_wordlist()
         if not wordlist:
             return []
