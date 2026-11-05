@@ -1,151 +1,90 @@
-"""
-Database Enumerator (MySQL, PostgreSQL, MSSQL)
-- Protocol-level handshake probes
-- Detect version and capabilities
-- Detect auth requirements
-"""
-import socket
-import struct
-import re
-from typing import Dict
+"""Read-only MySQL, PostgreSQL, and MSSQL protocol handshakes."""
+from __future__ import annotations
+import socket, ssl, struct
+from typing import Any, Dict
 
+def _recv_exact(sock: socket.socket,size: int)->bytes:
+    data=bytearray()
+    while len(data)<size:
+        chunk=sock.recv(size-len(data))
+        if not chunk: raise ConnectionError("Database peer closed connection")
+        data.extend(chunk)
+    return bytes(data)
 
 class MySQLEnumerator:
-    DEFAULT_PORT = 3306
-
+    DEFAULT_PORT=3306
     @staticmethod
-    def scan(ip: str, port: int = 3306) -> Dict:
-        result = {
-            "module": "mysql", "target": ip, "port": port,
-            "open": False, "version": None, "vulnerabilities": []
-        }
+    def parse_handshake(packet: bytes):
+        if len(packet)<6 or packet[0] not in (9,10): return None
+        end=packet.find(b"\x00",1)
+        return packet[1:end].decode("ascii",errors="replace") if end>1 else None
+    @staticmethod
+    def scan(ip: str,port: int=3306)->Dict[str,Any]:
+        result={"module":"mysql","target":ip,"port":port,"open":False,"version":None,"vulnerabilities":[]}
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            s.connect((ip, port))
-            # MySQL handshake: packet length (3) + seq (1) + protocol version (1) + server version (null-terminated)
-            header = s.recv(4)
-            if len(header) < 4:
-                s.close()
-                return result
-            pkt_len = header | (header << 8) | (header << 16)
-            data = s.recv(pkt_len)
-            s.close()
-            result["open"] = True
-            # Skip protocol version (1 byte)
-            version_end = data.find(b"\x00", 1)
-            if version_end > 0:
-                result["version"] = data[1:version_end].decode("latin-1", errors="replace")
-            result["vulnerabilities"].append({
-                "name": "MySQL exposed to network",
-                "severity": "MEDIUM",
-                "cve": "N/A"
-            })
-        except Exception as e:
-            result["error"] = str(e)
+            with socket.create_connection((ip,port),timeout=5) as sock:
+                sock.settimeout(5); header=_recv_exact(sock,4)
+                size=int.from_bytes(header[:3],"little")
+                if not 6<=size<=1024*1024: raise ValueError("Invalid MySQL handshake length")
+                packet=_recv_exact(sock,size)
+            version=MySQLEnumerator.parse_handshake(packet)
+            if version is None: raise ValueError("Unrecognized MySQL handshake")
+            result["open"]=True; result["version"]=version
+            result["observations"]=["Handshake detected; network exposure alone is not a confirmed vulnerability."]
+        except (OSError,ValueError,ConnectionError) as exc: result["error"]=type(exc).__name__
         return result
-
 
 class PostgreSQLEnumerator:
-    DEFAULT_PORT = 5432
-
+    DEFAULT_PORT=5432
     @staticmethod
-    def scan(ip: str, port: int = 5432) -> Dict:
-        result = {
-            "module": "postgresql", "target": ip, "port": port,
-            "open": False, "version": None, "vulnerabilities": []
-        }
+    def startup_message(user: str="spectrascan",database: str="postgres")->bytes:
+        body=struct.pack(">I",196608)+f"user\x00{user}\x00database\x00{database}\x00client_encoding\x00UTF8\x00\x00".encode()
+        return struct.pack(">I",len(body)+4)+body
+    @staticmethod
+    def scan(ip: str,port: int=5432)->Dict[str,Any]:
+        result={"module":"postgresql","target":ip,"port":port,"open":False,"ssl_supported":None,
+                "tls_negotiated":False,"auth_required":None,"version":None,"vulnerabilities":[]}
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            s.connect((ip, port))
-            # PostgreSQL: send SSL request first to see if SSL is supported
-            ssl_req = struct.pack(">IIII", 8, 80877103, 0, 0)
-            s.send(ssl_req)
-            resp = s.recv(1)
-            if resp == b"S":
-                result["ssl_supported"] = True
-                s.close()
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5.0)
-                s.connect((ip, port))
-            else:
-                result["ssl_supported"] = False
-            # Send startup message - fails with error that contains version info
-            startup = struct.pack(">II", 8, 196608)  # protocol 3.0
-            s.send(startup)
-            data = s.recv(1024)
-            s.close()
-            result["open"] = True
-            # Error message format: 'E' + length(4) + fields
-            if data and data[0:1] in (b"E", b"R"):
-                # Try to find version in error message text
-                text = data.decode("latin-1", errors="replace")
-                ver_match = re.search(r"(\d+\.\d+(?:\.\d+)?)", text)
-                if ver_match:
-                    result["version"] = ver_match.group(1)
-                result["error_response_sample"] = text[:200]
-            result["vulnerabilities"].append({
-                "name": "PostgreSQL exposed to network",
-                "severity": "MEDIUM",
-                "cve": "N/A"
-            })
-        except Exception as e:
-            result["error"] = str(e)
+            with socket.create_connection((ip,port),timeout=5) as raw:
+                raw.settimeout(5); raw.sendall(struct.pack(">II",8,80877103))
+                response=_recv_exact(raw,1); result["open"]=True; result["ssl_supported"]=response==b"S"
+                channel=raw
+                if response==b"S":
+                    try:
+                        channel=ssl.create_default_context().wrap_socket(raw,server_hostname=ip)
+                        result["tls_negotiated"]=True
+                    except ssl.SSLError:
+                        result["tls_error"]="certificate_or_handshake_error"; return result
+                elif response!=b"N":
+                    result["error"]="unexpected_ssl_response"; return result
+                channel.sendall(PostgreSQLEnumerator.startup_message())
+                kind=_recv_exact(channel,1); size=struct.unpack(">I",_recv_exact(channel,4))[0]
+                if not 4<=size<=1024*1024: raise ValueError("Invalid PostgreSQL response length")
+                payload=_recv_exact(channel,size-4)
+                if kind==b"R":
+                    result["auth_required"]=True
+                    result["auth_method_code"]=struct.unpack(">I",payload[:4])[0] if len(payload)>=4 else None
+                elif kind==b"E":
+                    sample=payload.decode("utf-8",errors="replace")
+                    result["auth_required"]="password" in sample.lower() or "authentication" in sample.lower()
+                    result["error_response_sample"]=sample[:200]
+                else: result["response_type"]=kind.decode("ascii",errors="replace")
+        except (OSError,ValueError,ConnectionError,struct.error) as exc: result["error"]=type(exc).__name__
         return result
-
 
 class MSSQLEnumerator:
-    DEFAULT_PORT = 1433
-
+    DEFAULT_PORT=1433
     @staticmethod
-    def scan(ip: str, port: int = 1433) -> Dict:
-        result = {
-            "module": "mssql", "target": ip, "port": port,
-            "open": False, "version": None, "instance_name": None,
-            "vulnerabilities": []
-        }
+    def scan(ip: str,port: int=1433)->Dict[str,Any]:
+        result={"module":"mssql","target":ip,"port":port,"open":False,"version":None,"instance_name":None,"vulnerabilities":[]}
+        prelogin=bytes([0x12,0x01,0x00,0x2f,0,0,0,1,0,0,0x15,0,6,1,0,0x1b,0,1,2,0,0x1c,0,1,3,0,0x1d,0,0,4,0,0,0xff])
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            s.connect((ip, port))
-            # TDS PRELOGIN
-            prelogin = bytes([
-                0x12, 0x01, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x01,
-                0x00, 0x00, 0x15, 0x00, 0x06, 0x01, 0x00, 0x1b,
-                0x00, 0x01, 0x02, 0x00, 0x1c, 0x00, 0x01, 0x03,
-                0x00, 0x1d, 0x00, 0x00, 0x04, 0x00, 0x00, 0xff
-            ])
-            s.send(prelogin)
-            resp = s.recv(4096)
-            s.close()
-            result["open"] = True
-            # Parse PRELOGIN response
-            if len(resp) > 30:
-                # Look for version in TDS response
-                text = resp.decode("latin-1", errors="replace")
-                ver_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", text)
-                if ver_match:
-                    result["version"] = ver_match.group(1)
-                # Instance name often in payload
-                idx = resp.find(b"MSSQLSERVER")
-                if idx > 0:
-                    end = resp.find(b"\x00", idx)
-                    result["instance_name"] = resp[idx:end].decode("latin-1", errors="replace")
-            result["vulnerabilities"].append({
-                "name": "MSSQL exposed to network",
-                "severity": "MEDIUM",
-                "cve": "N/A"
-            })
-        except Exception as e:
-            result["error"] = str(e)
+            with socket.create_connection((ip,port),timeout=5) as sock:
+                sock.settimeout(5); sock.sendall(prelogin); response=sock.recv(4096)
+            result["open"]=bool(response); result["response_bytes"]=len(response)
+        except OSError as exc: result["error"]=type(exc).__name__
         return result
 
-
-def scan_all_databases(ip: str) -> Dict:
-    """Scan all common database ports."""
-    return {
-        "mysql": MySQLEnumerator.scan(ip),
-        "postgresql": PostgreSQLEnumerator.scan(ip),
-        "mssql": MSSQLEnumerator.scan(ip),
-    }
+def scan_all_databases(ip: str)->Dict[str,Any]:
+    return {"mysql":MySQLEnumerator.scan(ip),"postgresql":PostgreSQLEnumerator.scan(ip),
+            "mssql":MSSQLEnumerator.scan(ip)}
