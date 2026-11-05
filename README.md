@@ -39,6 +39,10 @@ The current `main` branch contains the 2.2.0 feature set. This release builds on
 
 > **Release integrity:** this documents the `main` code state; it does not claim a GitHub Release or PyPI package has been published.
 
+### Stabilization work
+
+The `fix/2.2.4b-stabilization` branch is the development track for the **2.2.4b** stabilization candidate. It is not a published release; readiness depends on the regression suite and Linux/Windows CI matrix.
+
 ## 📑 Table of Contents
 
 - [🎯 Why SpectraScan?](#-why-spectrascan)

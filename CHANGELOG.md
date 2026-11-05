@@ -55,6 +55,24 @@ This release records the feature and hardening work present on \`main\`. The rel
 
 ---
 
+## [2.2.4b] — Stabilization candidate (unreleased)
+
+### Fixed
+- Repair SNMP BER integer, OID, and response parsing; use cross-platform executable discovery for the optional snmpwalk fallback.
+- Correct MongoDB OP_MSG framing and BSON lengths, nested documents, arrays, and boolean handling.
+- Correct Redis RESP parsing and version extraction; only report unauthenticated INFO exposure when that command succeeds.
+- Correct MySQL packet-length parsing and PostgreSQL SSLRequest/startup-message framing.
+- Correct NFS RPC/XDR record lengths and export parsing; use PATH-based showmount discovery on Windows and POSIX.
+- Parse RDP negotiation responses accurately and avoid inferring BlueKeep from an open port; parse RTSP status, headers, and SDP separately.
+- Consume complete multiline SMTP responses and avoid claiming plaintext credential exposure solely because STARTTLS is unavailable.
+- Route interactive protocol menu actions through their actual protocol modules and preserve per-port results for duplicate service names.
+- Accept HTTP(S) URLs as legacy CLI scan targets and handle async scan exceptions without a missing import.
+
+### Validation
+- Add protocol parser and dispatch regression tests.
+- Extend Bandit checks to the modified protocol and aggregator modules.
+- Release readiness depends on the complete Python 3.10–3.12 Linux/Windows test matrix.
+
 ## [Unreleased]
 
 ### Planned

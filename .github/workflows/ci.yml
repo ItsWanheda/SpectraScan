@@ -35,7 +35,7 @@ jobs:
         run: python -m unittest discover -s tests -p "test_*.py"
       - name: Static security checks for hardened modules
         if: runner.os == 'Linux'
-        run: bandit -r modules/async_scanner.py modules/brute_forcer.py modules/vuln_scanner.py modules/report_store.py -ll
+        run: bandit -r modules/async_scanner.py modules/brute_forcer.py modules/vuln_scanner.py modules/report_store.py modules/snmp_enum.py modules/mongodb_enum.py modules/redis_enum.py modules/database_enum.py modules/nfs_enum.py modules/rdp_enum.py modules/rtsp_enum.py modules/smtp_enum.py modules/network_services.py -ll
       - name: Dependency vulnerability audit
         if: runner.os == 'Linux' && matrix.python-version == '3.12'
         run: pip-audit -r requirements.txt
