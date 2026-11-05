@@ -19,8 +19,12 @@ SERVICE_MAP={
 def scan_port_with_service(ip: str,port: int,**kwargs: Any)->Dict[str,Any]:
     name,func=SERVICE_MAP.get(port,(None,None))
     if func is None: return {"module":name or "unknown","target":ip,"port":port,"skipped":True}
-    try: return func(ip,port=port,**kwargs)
-    except Exception as exc: return {"module":name,"target":ip,"port":port,"error":type(exc).__name__}
+    try:
+        if port in (161, 2049):
+            return func(ip, **kwargs)
+        return func(ip, port=port, **kwargs)
+    except Exception as exc:
+        return {"module":name,"target":ip,"port":port,"error":type(exc).__name__}
 
 def deep_scan(ip: str,ports: List[int]=None,max_workers: int=5)->Dict[str,Any]:
     if isinstance(max_workers,bool) or not 1<=int(max_workers)<=32: raise ValueError("max_workers must be 1..32")
