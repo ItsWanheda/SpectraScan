@@ -7,6 +7,7 @@ Features: SYN, UDP, OS Detection, SSL/TLS, HTTP Enum, Firewall Detection,
 import socket
 import concurrent.futures
 import argparse
+import asyncio
 import sys
 import time
 import json
@@ -4392,26 +4393,38 @@ def normalize_target(target: str) -> str:
 
 
 def resolve_host(hostname: str) -> str:
-    """Resolve a single host or IP. CIDR networks must use the network-scan path."""
+    """Resolve an IP, hostname, host:port, or HTTP(S) URL for legacy IPv4 probes."""
     target = normalize_target(hostname)
     if not target:
         raise ValueError("Target cannot be empty")
+    if "://" in target:
+        parsed = urllib.parse.urlsplit(target)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Only valid HTTP(S) URLs can be used as scan targets")
+        host = parsed.hostname
+    else:
+        host = target
+        if host.startswith("[") and "]" in host:
+            host = host[1:host.index("]")]
+        elif host.count(":") == 1:
+            candidate, port = host.rsplit(":", 1)
+            if port.isdigit() and candidate:
+                host = candidate
     try:
-        return str(ipaddress.ip_address(target))
+        return str(ipaddress.ip_address(host))
     except ValueError:
         pass
-    if "/" in target:
+    if "/" in host:
         try:
-            network = ipaddress.ip_network(target, strict=False)
+            network = ipaddress.ip_network(host, strict=False)
         except ValueError:
             pass
         else:
             raise ValueError(f"CIDR network detected: {network}")
     try:
-        return socket.gethostbyname(target)
+        return socket.gethostbyname(host)
     except socket.gaierror as exc:
-        raise ValueError(f"Cannot resolve target: {target}") from exc
-
+        raise ValueError(f"Cannot resolve target host: {host}") from exc
 def reverse_dns(ip: str) -> str:
     """Reverse DNS lookup"""
     try:
@@ -5327,231 +5340,106 @@ class NetworkScanner:
 
 # ============== Protocol Module Scanner ==============
 class ProtocolModuleScanner:
-    """Stub implementation of protocol scanners.
-    Replace these methods with calls into the real modules in ./modules if present.
-    """
+    """Interactive-menu adapter that dispatches to the real protocol modules."""
 
     @staticmethod
     def _print_result(name: str, result: Dict):
         console.print(f"\n[bold cyan]--- {name} ---[/bold cyan]")
-        if isinstance(result, dict):
-            for key, value in result.items():
-                console.print(f"  [green]{key}:[/green] {value}")
-        else:
-            console.print(f"  {result}")
+        console.print(json.dumps(result, indent=2, ensure_ascii=False, default=str), markup=False)
 
     @staticmethod
-    def _tcp_probe(ip: str, port: int, timeout: float = 5.0) -> Dict:
-        result = {"ip": ip, "port": port, "state": "closed", "banner": None}
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            if sock.connect_ex((ip, port)) == 0:
-                result["state"] = "open"
-                try:
-                    sock.settimeout(2.0)
-                    data = sock.recv(256)
-                    if data:
-                        result["banner"] = data.decode("utf-8", errors="ignore").strip()
-                except:
-                    pass
-            sock.close()
-        except socket.timeout:
-            result["state"] = "filtered"
-        except Exception as e:
-            result["state"] = "error"
-            result["error"] = str(e)
-        return result
+    def _ip(target: str) -> str:
+        if not target or "/" in target:
+            raise ValueError("Protocol enumeration requires one authorized host")
+        return resolve_host(target)
 
     @staticmethod
     def run_smb(target: str):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = ProtocolModuleScanner._tcp_probe(ip, 445)
+        result = SMBEnumerator.scan(ProtocolModuleScanner._ip(target))
         ProtocolModuleScanner._print_result("SMB Enumerator", result)
         return result
 
     @staticmethod
     def run_snmp(target: str):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = ProtocolModuleScanner._tcp_probe(ip, 161, timeout=3.0)
-        # SNMP is UDP, so do a quick UDP probe too
-        try:
-            usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            usock.settimeout(3.0)
-            probe = b"\x30\x00\x00\x00\x02\x01\x00\x04\x06public\xa0\x1f\x02\x01\x00\x02\x01\x00\x30\x14"
-            usock.sendto(probe, (ip, 161))
-            data, _ = usock.recvfrom(1024)
-            result["snmp_response"] = data.hex()[:100]
-            result["state"] = "open"
-            usock.close()
-        except socket.timeout:
-            result["snmp_response"] = None
-        except Exception as e:
-            result["snmp_error"] = str(e)
+        from modules.snmp_enum import SNMPEnumerator
+        result = SNMPEnumerator.scan(ProtocolModuleScanner._ip(target))
         ProtocolModuleScanner._print_result("SNMP Enumerator", result)
         return result
 
     @staticmethod
     def run_ldap(target: str, port: int = 389):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = ProtocolModuleScanner._tcp_probe(ip, port)
+        result = LDAPEnumerator.scan(ProtocolModuleScanner._ip(target), port=port)
         ProtocolModuleScanner._print_result("LDAP Enumerator", result)
         return result
 
     @staticmethod
     def run_rdp(target: str):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = ProtocolModuleScanner._tcp_probe(ip, 3389)
+        from modules.rdp_enum import RDPEnumerator
+        result = RDPEnumerator.scan(ProtocolModuleScanner._ip(target))
         ProtocolModuleScanner._print_result("RDP Enumerator", result)
         return result
 
     @staticmethod
     def run_smtp(target: str, port: int = 25, test_relay: bool = True):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = {"banner": None, "open_relay": None, "error": None}
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((ip, port))
-            banner = sock.recv(1024).decode("utf-8", errors="ignore").strip()
-            result["banner"] = banner
-            if test_relay:
-                sock.send(b"EHLO test.local\r\n")
-                sock.recv(1024)
-                sock.send(b"MAIL FROM:<test@test.local>\r\n")
-                resp = sock.recv(1024).decode("utf-8", errors="ignore")
-                sock.send(b"RCPT TO:<probe@example.com>\r\n")
-                resp2 = sock.recv(1024).decode("utf-8", errors="ignore")
-                result["open_relay"] = "250" in resp2
-            sock.send(b"QUIT\r\n")
-            sock.close()
-        except Exception as e:
-            result["error"] = str(e)
+        from modules.smtp_enum import SMTPEnumerator
+        result = SMTPEnumerator.scan(ProtocolModuleScanner._ip(target), port=port, test_relay=test_relay)
         ProtocolModuleScanner._print_result("SMTP Enumerator", result)
         return result
 
     @staticmethod
     def run_dns_zone(domain: str):
-        result = {"domain": domain, "records": {}}
-        try:
-            import dns.resolver
-            import dns.zone
-            import dns.query
-            ns_answers = dns.resolver.resolve(domain, "NS")
-            for ns in ns_answers:
-                ns_str = str(ns).rstrip(".")
-                try:
-                    z = dns.zone.from_xfr(dns.query.xfr(ns_str, domain, timeout=5))
-                    result["records"][ns_str] = [str(n) for n in z.nodes.keys()]
-                except Exception as e:
-                    result["records"][ns_str] = f"Transfer failed: {e}"
-        except ImportError:
-            result["records"]["error"] = "dnspython not installed"
-        except Exception as e:
-            result["records"]["error"] = str(e)
+        result = DNSZone.scan(domain)
         ProtocolModuleScanner._print_result("DNS Zone Transfer", result)
         return result
 
     @staticmethod
     def run_nfs(target: str):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = ProtocolModuleScanner._tcp_probe(ip, 2049)
+        from modules.nfs_enum import NFSEnumerator
+        result = NFSEnumerator.scan(ProtocolModuleScanner._ip(target))
         ProtocolModuleScanner._print_result("NFS Enumerator", result)
         return result
 
     @staticmethod
     def run_vnc(target: str, port: int = 5900):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = ProtocolModuleScanner._tcp_probe(ip, port)
+        from modules.vnc_enum import VNCEnumerator
+        result = VNCEnumerator.scan(ProtocolModuleScanner._ip(target), port=port)
         ProtocolModuleScanner._print_result("VNC Enumerator", result)
         return result
 
     @staticmethod
     def run_redis(target: str, port: int = 6379):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = {"ip": ip, "port": port}
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((ip, port))
-            sock.send(b"PING\r\n")
-            data = sock.recv(1024).decode("utf-8", errors="ignore").strip()
-            result["response"] = data
-            result["unauth"] = "PONG" in data
-            sock.close()
-        except Exception as e:
-            result["error"] = str(e)
+        from modules.redis_enum import RedisEnumerator
+        result = RedisEnumerator.scan(ProtocolModuleScanner._ip(target), port=port)
         ProtocolModuleScanner._print_result("Redis Enumerator", result)
         return result
 
     @staticmethod
     def run_mongodb(target: str, port: int = 27017):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = {"ip": ip, "port": port}
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((ip, port))
-            # Send a minimal ismaster command
-            sock.close()
-            result["state"] = "open"
-        except Exception as e:
-            result["error"] = str(e)
+        from modules.mongodb_enum import MongoDBEnumerator
+        result = MongoDBEnumerator.scan(ProtocolModuleScanner._ip(target), port=port)
         ProtocolModuleScanner._print_result("MongoDB Enumerator", result)
         return result
 
     @staticmethod
     def run_sip(target: str, port: int = 5060):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = {"ip": ip, "port": port, "state": "unknown"}
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(3.0)
-            sock.sendto(b"OPTIONS sip:test@" + ip.encode() + b" SIP/2.0\r\n\r\n", (ip, port))
-            data, _ = sock.recvfrom(1024)
-            result["state"] = "open"
-            result["response"] = data.decode("utf-8", errors="ignore").strip()[:200]
-            sock.close()
-        except socket.timeout:
-            result["state"] = "open|filtered"
-        except Exception as e:
-            result["error"] = str(e)
+        from modules.sip_enum import SIPEnumerator
+        result = SIPEnumerator.scan(ProtocolModuleScanner._ip(target), port=port)
         ProtocolModuleScanner._print_result("SIP Enumerator", result)
         return result
 
     @staticmethod
     def run_rtsp(target: str, port: int = 554):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        result = {"ip": ip, "port": port}
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((ip, port))
-            sock.send(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
-            data = sock.recv(1024).decode("utf-8", errors="ignore").strip()
-            result["response"] = data[:200]
-            result["state"] = "open"
-            sock.close()
-        except Exception as e:
-            result["error"] = str(e)
+        from modules.rtsp_enum import RTSPEnumerator
+        result = RTSPEnumerator.scan(ProtocolModuleScanner._ip(target), port=port)
         ProtocolModuleScanner._print_result("RTSP Enumerator", result)
         return result
 
     @staticmethod
     def run_databases(target: str):
-        ip = target if target.replace(".", "").isdigit() else resolve_host(target)
-        db_ports = {
-            "mysql": 3306,
-            "postgres": 5432,
-            "mssql": 1433,
-            "oracle": 1521,
-        }
-        results = {}
-        for db, port in db_ports.items():
-            results[db] = ProtocolModuleScanner._tcp_probe(ip, port, timeout=3.0)
-        for db_name, db_result in results.items():
-            ProtocolModuleScanner._print_result(db_name.upper(), db_result)
-        return results
+        from modules.database_enum import scan_all_databases
+        result = scan_all_databases(ProtocolModuleScanner._ip(target))
+        ProtocolModuleScanner._print_result("Database Enumerator", result)
+        return result
 
 
 def run_protocol_modules():

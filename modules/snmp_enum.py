@@ -1,202 +1,166 @@
-"""
-SNMP Enumerator
-- Detect SNMP (UDP 161)
-- Query system info, processes, users, network interfaces
-- Tries common community strings
-- Uses pysnmp if available, otherwise raw BER parser fallback, otherwise snmpwalk
-"""
-import socket
-import subprocess
-import random
-import struct
-from typing import Dict, List
+"""SNMPv2c query and response handling using bounded BER parsing."""
+from __future__ import annotations
+import random, shutil, socket, subprocess
+from typing import Any, Dict, List, Optional, Tuple
 
+class SNMPError(ValueError): pass
+
+def _length(n: int) -> bytes:
+    if n < 0: raise ValueError("negative BER length")
+    if n < 128: return bytes([n])
+    raw = n.to_bytes((n.bit_length()+7)//8, "big")
+    return bytes([0x80|len(raw)]) + raw
+
+def _tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + _length(len(value)) + value
+
+def _integer(value: int, tag: int = 2) -> bytes:
+    if value == 0: raw = b"\x00"
+    else:
+        raw = value.to_bytes(max(1,(value.bit_length()+8)//8),"big",signed=True)
+        while len(raw)>1 and ((raw[0]==0 and not raw[1]&128) or (raw[0]==255 and raw[1]&128)): raw=raw[1:]
+    return _tlv(tag,raw)
+
+def _base128(value: int) -> bytes:
+    if value < 0: raise ValueError("negative OID arc")
+    out=[value&127]; value >>= 7
+    while value: out.append(128|(value&127)); value >>= 7
+    return bytes(reversed(out))
+
+def _oid(oid: str) -> bytes:
+    try: arcs=[int(v) for v in oid.strip(".").split(".")]
+    except (TypeError,ValueError) as exc: raise ValueError("invalid OID") from exc
+    if len(arcs)<2 or arcs[0] not in (0,1,2) or any(v<0 for v in arcs) or (arcs[0]<2 and arcs[1]>39):
+        raise ValueError("invalid OID arcs")
+    return _tlv(6,_base128(40*arcs[0]+arcs[1])+b"".join(_base128(v) for v in arcs[2:]))
+
+def _read_length(data: bytes, pos: int) -> Tuple[int,int]:
+    if pos>=len(data): raise SNMPError("missing BER length")
+    first=data[pos]; pos+=1
+    if first<128: return first,pos
+    count=first&127
+    if not count or count>4 or pos+count>len(data) or data[pos]==0: raise SNMPError("invalid BER length")
+    size=int.from_bytes(data[pos:pos+count],"big")
+    if size<128: raise SNMPError("non-canonical BER length")
+    return size,pos+count
+
+def _read_tlv(data: bytes,pos: int=0) -> Tuple[int,bytes,int]:
+    if pos>=len(data): raise SNMPError("missing BER tag")
+    tag=data[pos]; size,start=_read_length(data,pos+1); end=start+size
+    if end>len(data): raise SNMPError("BER value exceeds message")
+    return tag,data[start:end],end
+
+def _decode_oid(raw: bytes) -> str:
+    arcs=[]; value=0
+    for byte in raw:
+        value=(value<<7)|(byte&127)
+        if not byte&128: arcs.append(value); value=0
+    if not raw or raw[-1]&128 or not arcs: raise SNMPError("invalid OID encoding")
+    first=min(arcs[0]//40,2)
+    return ".".join(map(str,[first,arcs[0]-40*first,*arcs[1:]]))
+
+def _decode_value(tag: int, raw: bytes) -> str:
+    if tag==6: return _decode_oid(raw)
+    if tag in (2,65,66,67,70):
+        n=int.from_bytes(raw,"big",signed=(tag==2))
+        return f"{n} ticks" if tag==67 else str(n)
+    if tag==4: return raw.decode("utf-8",errors="replace")
+    if tag==5: return "NULL"
+    if tag in (128,129,130): return {128:"noSuchObject",129:"noSuchInstance",130:"endOfMibView"}[tag]
+    return raw.hex()
+
+def _parse_response(data: bytes, expected_oid: Optional[str]=None) -> str:
+    tag,msg,end=_read_tlv(data)
+    if tag!=48 or end!=len(data): raise SNMPError("invalid SNMP envelope")
+    _,_,pos=_read_tlv(msg,0)
+    community_tag,_,pos=_read_tlv(msg,pos)
+    if community_tag!=4: raise SNMPError("invalid community field")
+    pdu_tag,pdu,_=_read_tlv(msg,pos)
+    if pdu_tag!=162: raise SNMPError("expected GetResponse PDU")
+    _,_,pos=_read_tlv(pdu,0)
+    status_tag,status,pos=_read_tlv(pdu,pos)
+    _,_,pos=_read_tlv(pdu,pos)
+    list_tag,bindings,_=_read_tlv(pdu,pos)
+    if status_tag!=2 or list_tag!=48 or int.from_bytes(status,"big",signed=True)!=0:
+        raise SNMPError("SNMP agent returned an error")
+    bind_tag,binding,bind_end=_read_tlv(bindings)
+    if bind_tag!=48 or bind_end!=len(bindings): raise SNMPError("invalid variable binding")
+    oid_tag,oid_raw,pos=_read_tlv(binding,0)
+    value_tag,value_raw,_=_read_tlv(binding,pos)
+    returned=_decode_oid(oid_raw) if oid_tag==6 else ""
+    if expected_oid and returned!=expected_oid: raise SNMPError("response OID mismatch")
+    return _decode_value(value_tag,value_raw)
 
 class SNMPEnumerator:
-    DEFAULT_COMMUNITIES = ["public", "private", "manager", "monitor", "admin", "cisco", "snmp"]
-    SYSTEM_OIDS = {
-        "1.3.6.1.2.1.1.1.0": "sysDescr",
-        "1.3.6.1.2.1.1.2.0": "sysObjectID",
-        "1.3.6.1.2.1.1.3.0": "sysUpTime",
-        "1.3.6.1.2.1.1.4.0": "sysContact",
-        "1.3.6.1.2.1.1.5.0": "sysName",
-        "1.3.6.1.2.1.1.6.0": "sysLocation",
-        "1.3.6.1.2.1.1.7.0": "sysServices",
-    }
+    DEFAULT_COMMUNITIES=["public","private","manager","monitor","admin","cisco","snmp"]
+    SYSTEM_OIDS={
+        "1.3.6.1.2.1.1.1.0":"sysDescr","1.3.6.1.2.1.1.2.0":"sysObjectID",
+        "1.3.6.1.2.1.1.3.0":"sysUpTime","1.3.6.1.2.1.1.4.0":"sysContact",
+        "1.3.6.1.2.1.1.5.0":"sysName","1.3.6.1.2.1.1.6.0":"sysLocation",
+        "1.3.6.1.2.1.1.7.0":"sysServices"}
+    _ber_encode_length=staticmethod(_length)
+    _ber_encode_integer=staticmethod(_integer)
+    _ber_encode_oid=staticmethod(_oid)
 
     @staticmethod
-    def _ber_encode_length(length: int) -> bytes:
-        if length < 128:
-            return bytes([length])
-        data = []
-        while length > 0:
-            data.insert(0, length & 0xff)
-            length >>= 8
-        return bytes([0x80 | len(data)] + data)
+    def _build_get_request(community: str, oid: str, request_id: Optional[int]=None) -> bytes:
+        rid=request_id if request_id is not None else random.randint(1,2**31-1)
+        binding=_tlv(48,_oid(oid)+_tlv(5,b""))
+        bindings=_tlv(48,binding)
+        pdu=_tlv(160,_integer(rid)+_integer(0)+_integer(0)+bindings)
+        return _tlv(48,_integer(1)+_tlv(4,community.encode("utf-8"))+pdu)
 
     @staticmethod
-    def _ber_encode_integer(value: int) -> bytes:
-        if value == 0:
-            data = b"\x00"
-        else:
-            data = []
-            v = value
-            while v > 0:
-                data.insert(0, v & 0xff)
-                v >>= 8
-            if data & 0x80:
-                data.insert(0, 0)
-            data = bytes(data)
-        return b"\x02" + SNMPEnumerator._ber_encode_length(len(data)) + data
-
-    @staticmethod
-    def _ber_encode_string(s: bytes) -> bytes:
-        return b"\x04" + SNMPEnumerator._ber_encode_length(len(s)) + s
-
-    @staticmethod
-    def _ber_encode_oid(oid: str) -> bytes:
-        parts = [int(x) for x in oid.split(".")]
-        if len(parts) < 2:
-            return b""
-        encoded = [40 * parts + parts]
-        for p in parts[2:]:
-            if p < 128:
-                encoded.append(p)
-            else:
-                stack = []
-                v = p
-                while v > 0:
-                    stack.append(v & 0x7f)
-                    v >>= 7
-                stack.reverse()
-                for i in range(len(stack) - 1):
-                    stack[i] |= 0x80
-                encoded.extend(stack)
-        data = bytes(encoded)
-        return b"\x06" + SNMPEnumerator._ber_encode_length(len(data)) + data
-
-    @staticmethod
-    def _build_get_request(community: str, oid: str, request_id: int = None) -> bytes:
-        if request_id is None:
-            request_id = random.randint(1, 2**31 - 1)
-
-        # VarBind: OID + NULL
-        varbind = (
-            b"\x30" + SNMPEnumerator._ber_encode_length(0)
-            + SNMPEnumerator._ber_encode_oid(oid)
-            + b"\x05\x00"
-        )
-        varbind = b"\x30" + SNMPEnumerator._ber_encode_length(len(varbind)) + varbind
-
-        # PDU: GetRequest (0xa0)
-        req_id = SNMPEnumerator._ber_encode_integer(request_id)
-        error = SNMPEnumerator._ber_encode_integer(0)
-        err_idx = SNMPEnumerator._ber_encode_integer(0)
-        pdu_body = req_id + error + err_idx + varbind
-        pdu = b"\xa0" + SNMPEnumerator._ber_encode_length(len(pdu_body)) + pdu_body
-
-        # Version: 1 (SNMPv2c)
-        version = b"\x02\x01\x01"
-        community_enc = SNMPEnumerator._ber_encode_string(community.encode())
-        msg_body = version + community_enc + pdu
-        msg = b"\x30" + SNMPEnumerator._ber_encode_length(len(msg_body)) + msg_body
-        return msg
-
-    @staticmethod
-    def query(ip: str, community: str, oid: str, timeout: float = 3.0) -> str:
-        """Send SNMP GET request, return value as string or None."""
+    def query(ip: str, community: str, oid: str, timeout: float=3.0) -> Optional[str]:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(timeout)
-            pkt = SNMPEnumerator._build_get_request(community, oid)
-            s.sendto(pkt, (ip, 161))
-            data, _ = s.recvfrom(4096)
-            s.close()
-            # Crude parser: find OCTET STRING or INTEGER value after the OID
-            # Skip to varbind value
-            if b"\x04" in data or b"\x02" in data or b"\x06" in data:
-                # Find last value-type byte and read length
-                for marker in [b"\x04", b"\x02", b"\x06", b"\x41"]:
-                    idx = data.rfind(marker)
-                    if idx >= 0 and idx + 1 < len(data):
-                        length = data[idx + 1]
-                        if length & 0x80 == 0 and idx + 2 + length <= len(data):
-                            value = data[idx + 2: idx + 2 + length]
-                            try:
-                                return value.decode("utf-8", errors="replace")
-                            except Exception:
-                                return value.hex()
-                # Fallback: dump everything after OID match
-                return data.hex()
-        except socket.timeout:
-            return None
-        except Exception:
-            return None
+            family=socket.AF_INET6 if ":" in ip else socket.AF_INET
+            with socket.socket(family,socket.SOCK_DGRAM) as sock:
+                sock.settimeout(timeout)
+                sock.sendto(SNMPEnumerator._build_get_request(community,oid),(ip,161))
+                data,_=sock.recvfrom(65535)
+            value=_parse_response(data,oid)
+            return None if value.startswith("noSuch") or value=="NULL" else value
+        except (OSError,SNMPError,ValueError): return None
+
+    @staticmethod
+    def _snmpwalk(ip: str, communities: List[str]) -> Optional[Dict[str,str]]:
+        exe=shutil.which("snmpwalk")
+        if not exe: return None
+        for community in communities:
+            try:
+                proc=subprocess.run([exe,"-v2c","-c",community,"-t","2",ip,"1.3.6.1.2.1.1"],
+                                     capture_output=True,text=True,timeout=15,check=False)
+            except (OSError,subprocess.TimeoutExpired): continue
+            if proc.returncode==0 and proc.stdout:
+                values={}
+                for line in proc.stdout.splitlines():
+                    key,sep,value=line.partition("=")
+                    if sep: values[key.strip()]=value.strip()
+                if values: return {"community":community,**values}
         return None
 
     @staticmethod
-    def scan(ip: str, communities: List[str] = None) -> Dict:
-        result = {
-            "module": "snmp", "target": ip, "open": False,
-            "community": None, "system": {}, "vulnerabilities": []
-        }
-        communities = communities or SNMPEnumerator.DEFAULT_COMMUNITIES
-
-        # First detect if SNMP is responding at all
-        for community in communities:
-            val = SNMPEnumerator.query(ip, community, "1.3.6.1.2.1.1.1.0", timeout=2.0)
-            if val and len(val) > 0 and "noSuch" not in val.lower():
-                result["open"] = True
-                result["community"] = community
-                # Query system info
-                for oid, name in SNMPEnumerator.SYSTEM_OIDS.items():
-                    v = SNMPEnumerator.query(ip, community, oid, timeout=2.0)
-                    if v:
-                        result["system"][name] = v
-                break
-
+    def scan(ip: str, communities: Optional[List[str]]=None) -> Dict[str,Any]:
+        result={"module":"snmp","target":ip,"open":False,"community":None,"system":{},"vulnerabilities":[]}
+        candidates=list(communities or SNMPEnumerator.DEFAULT_COMMUNITIES)
+        for community in candidates:
+            value=SNMPEnumerator.query(ip,community,"1.3.6.1.2.1.1.1.0",2.0)
+            if value is None: continue
+            result.update(open=True,community=community)
+            result["system"]["sysDescr"]=value
+            for oid,name in SNMPEnumerator.SYSTEM_OIDS.items():
+                if name=="sysDescr": continue
+                other=SNMPEnumerator.query(ip,community,oid,2.0)
+                if other is not None: result["system"][name]=other
+            break
         if not result["open"]:
-            # Last resort: try snmpwalk
-            for community in communities:
-                if subprocess.run(["which", "snmpwalk"], capture_output=True).returncode == 0:
-                    try:
-                        out = subprocess.run(
-                            ["snmpwalk", "-v2c", "-c", community, "-t", "2", ip, "1.3.6.1.2.1.1"],
-                            capture_output=True, text=True, timeout=30
-                        )
-                        if out.returncode == 0 and out.stdout:
-                            result["open"] = True
-                            result["community"] = community
-                            for line in out.stdout.splitlines():
-                                if "=" in line:
-                                    k, _, v = line.partition("=")
-                                    result["system"][k.strip()] = v.strip()
-                            break
-                    except Exception:
-                        pass
-            return result
-
-        # Detect vulnerabilities based on community string
-        weak = ["public", "private", "manager", "admin", "cisco", "monitor", "snmp", "test"]
-        if result["community"] in weak:
-            result["vulnerabilities"].append({
-                "name": f"Weak/default SNMP community string: '{result['community']}'",
-                "severity": "HIGH",
-                "cve": "N/A"
-            })
-
-        # Heuristic checks on sysDescr
-        desc = result["system"].get("sysDescr", "").lower()
-        if "linux" in desc or "ubuntu" in desc or "debian" in desc:
-            result["os_guess"] = "Linux"
-        elif "windows" in desc:
-            result["os_guess"] = "Windows"
-        elif "cisco" in desc or "ios" in desc:
-            result["os_guess"] = "Cisco IOS"
-            result["vulnerabilities"].append({
-                "name": "Cisco device exposed via SNMP",
-                "severity": "MEDIUM",
-                "cve": "N/A"
-            })
-
+            fallback=SNMPEnumerator._snmpwalk(ip,candidates)
+            if fallback:
+                result["open"]=True; result["community"]=fallback.pop("community"); result["system"]=fallback
+        if result["open"] and result["community"] in SNMPEnumerator.DEFAULT_COMMUNITIES:
+            result["vulnerabilities"].append({"name":"Default SNMP community string accepted","severity":"MEDIUM","cve":"N/A"})
+        desc=str(result["system"].get("sysDescr","")).lower()
+        if any(t in desc for t in ("linux","ubuntu","debian")): result["os_guess"]="Linux"
+        elif "windows" in desc: result["os_guess"]="Windows"
+        elif "cisco" in desc or "ios" in desc: result["os_guess"]="Cisco IOS"
         return result

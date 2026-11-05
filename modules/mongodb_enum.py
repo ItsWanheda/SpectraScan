@@ -1,183 +1,118 @@
-"""
-MongoDB Enumerator
-- Detect MongoDB (27017)
-- Try unauthenticated connection
-- Get server info, databases, sample documents
-- Detect wire version
-"""
-import socket
-import struct
-from typing import Dict, List
+"""MongoDB OP_MSG framing and BSON parsing."""
+from __future__ import annotations
+import socket, struct
+from typing import Any, Dict
 
+MAX_MESSAGE_SIZE=16*1024*1024
+
+def _recv_exact(sock: socket.socket,size: int)->bytes:
+    data=bytearray()
+    while len(data)<size:
+        chunk=sock.recv(size-len(data))
+        if not chunk: raise ConnectionError("MongoDB peer closed mid-frame")
+        data.extend(chunk)
+    return bytes(data)
 
 class MongoDBEnumerator:
-    DEFAULT_PORT = 27017
-
+    DEFAULT_PORT=27017
     @staticmethod
-    def check_open(ip: str, port: int = 27017, timeout: float = 3.0) -> bool:
+    def check_open(ip: str,port: int=27017,timeout: float=3.0)->bool:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            s.connect((ip, port))
-            s.close()
-            return True
-        except Exception:
-            return False
-
+            with socket.create_connection((ip,port),timeout=timeout): return True
+        except OSError: return False
     @staticmethod
-    def _send_op_msg(sock: socket.socket, doc: bytes) -> bytes:
-        """Send OP_MSG (opcode 2013) with given BSON document."""
-        # Flags (4) + section kind (1=doc, 0) + bson
-        section = b"\x00" + doc
-        # Body excludes opcode and requestID
-        body = struct.pack("<I", 0) + section  # flags + section
-        request_id = 1
-        msg_len = 16 + len(body)
-        header = struct.pack("<IIII", msg_len, request_id, 0, 2013)  # opcode 2013
-        sock.send(header + body)
-
-        # Read response
-        data = b""
-        try:
-            while len(data) < 4:
-                data += sock.recv(4 - len(data))
-            msg_len = struct.unpack("<I", data[:4])
-            data = b""
-            while len(data) < msg_len:
-                chunk = sock.recv(msg_len - len(data))
-                if not chunk:
-                    break
-                data += chunk
-        except socket.timeout:
-            pass
-        return data
-
+    def _send_op_msg(sock: socket.socket,doc: bytes,request_id: int=1)->bytes:
+        body=struct.pack("<I",0)+b"\x00"+doc
+        length=16+len(body)
+        if length>MAX_MESSAGE_SIZE: raise ValueError("MongoDB request too large")
+        sock.sendall(struct.pack("<iiii",length,request_id,0,2013)+body)
+        header=_recv_exact(sock,16)
+        response_length,_,response_to,opcode=struct.unpack("<iiii",header)
+        if response_length<21 or response_length>MAX_MESSAGE_SIZE or opcode!=2013:
+            raise ValueError("Invalid MongoDB response header")
+        if response_to not in (0,request_id): raise ValueError("MongoDB response id mismatch")
+        payload=_recv_exact(sock,response_length-16)
+        if payload[4]!=0: raise ValueError("Unsupported OP_MSG section")
+        document=payload[5:]
+        size=struct.unpack_from("<i",document,0)[0]
+        if size<5 or size>len(document): raise ValueError("Invalid BSON response length")
+        return document[:size]
     @staticmethod
-    def _bson_encode(doc: dict) -> bytes:
-        """Minimal BSON encoder for simple documents."""
-        parts = b""
-        for k, v in doc.items():
-            key_bytes = k.encode("utf-8")
-            if isinstance(v, int):
-                parts += b"\x10" + key_bytes + b"\x00" + struct.pack("<i", v)
-            elif isinstance(v, str):
-                v_bytes = v.encode("utf-8")
-                parts += b"\x02" + key_bytes + b"\x00" + struct.pack("<i", len(v_bytes) + 1) + v_bytes + b"\x00"
-            elif isinstance(v, bool):
-                parts += b"\x08" + key_bytes + b"\x00" + (b"\x01" if v else b"\x00")
-            elif isinstance(v, dict):
-                nested = MongoDBEnumerator._bson_encode(v)
-                parts += b"\x03" + key_bytes + b"\x00" + struct.pack("<i", len(nested)) + nested
-        doc_bytes = parts + b"\x00"
-        return struct.pack("<i", len(doc_bytes) + 4) + doc_bytes
-
+    def _bson_encode(doc: Dict[str,Any])->bytes:
+        elements=bytearray()
+        for key,value in doc.items():
+            if "\x00" in key: raise ValueError("BSON keys cannot contain NUL")
+            k=key.encode()+b"\x00"
+            if isinstance(value,bool): elements+=b"\x08"+k+(b"\x01" if value else b"\x00")
+            elif isinstance(value,int):
+                if -(2**31)<=value<2**31: elements+=b"\x10"+k+struct.pack("<i",value)
+                elif -(2**63)<=value<2**63: elements+=b"\x12"+k+struct.pack("<q",value)
+                else: raise ValueError("BSON integer out of range")
+            elif isinstance(value,str):
+                raw=value.encode()+b"\x00"; elements+=b"\x02"+k+struct.pack("<i",len(raw))+raw
+            elif value is None: elements+=b"\x0A"+k
+            elif isinstance(value,float): elements+=b"\x01"+k+struct.pack("<d",value)
+            elif isinstance(value,dict): elements+=b"\x03"+k+MongoDBEnumerator._bson_encode(value)
+            elif isinstance(value,list):
+                nested=MongoDBEnumerator._bson_encode({str(i):v for i,v in enumerate(value)})
+                elements+=b"\x04"+k+nested
+            else: raise TypeError(f"Unsupported BSON value: {type(value).__name__}")
+        payload=bytes(elements)+b"\x00"
+        return struct.pack("<i",len(payload)+4)+payload
     @staticmethod
-    def _parse_bson(data: bytes, offset: int = 0) -> Dict:
-        """Very minimal BSON parser for top-level documents."""
-        result = {}
-        try:
-            if offset + 5 > len(data):
-                return result
-            doc_len = struct.unpack("<i", data[offset:offset + 4])
-            end = offset + doc_len
-            pos = offset + 4
-            while pos < end - 1:
-                type_byte = data[pos]
-                pos += 1
-                # Read cstring key (null-terminated)
-                key_end = data.find(b"\x00", pos)
-                if key_end == -1:
-                    break
-                key = data[pos:key_end].decode("utf-8", errors="replace")
-                pos = key_end + 1
-                # Read value based on type
-                if type_byte == 0x10:  # int32
-                    if pos + 4 > end:
-                        break
-                    result[key] = struct.unpack("<i", data[pos:pos + 4])
-                    pos += 4
-                elif type_byte == 0x02:  # string
-                    if pos + 4 > end:
-                        break
-                    str_len = struct.unpack("<i", data[pos:pos + 4])
-                    pos += 4
-                    result[key] = data[pos:pos + str_len - 1].decode("utf-8", errors="replace")
-                    pos += str_len
-                elif type_byte == 0x08:  # bool
-                    result[key] = bool(data[pos])
-                    pos += 1
-                elif type_byte == 0x03:  # document
-                    nested_len = struct.unpack("<i", data[pos:pos + 4])
-                    result[key] = MongoDBEnumerator._parse_bson(data, pos)
-                    pos += nested_len
-                elif type_byte == 0x04:  # array
-                    arr_len = struct.unpack("<i", data[pos:pos + 4])
-                    pos += arr_len
-                elif type_byte == 0x01:  # double
-                    pos += 8
-                elif type_byte == 0x12:  # int64
-                    pos += 8
-                else:
-                    break
-        except Exception:
-            pass
+    def _parse_bson(data: bytes,offset: int=0)->Dict[str,Any]:
+        if offset<0 or offset+5>len(data): raise ValueError("Truncated BSON document")
+        size=struct.unpack_from("<i",data,offset)[0]; end=offset+size
+        if size<5 or end>len(data) or data[end-1]!=0: raise ValueError("Invalid BSON document bounds")
+        result={}; pos=offset+4
+        while pos<end-1:
+            kind=data[pos]; pos+=1
+            key_end=data.find(b"\x00",pos,end)
+            if key_end<0: raise ValueError("Unterminated BSON key")
+            key=data[pos:key_end].decode("utf-8",errors="replace"); pos=key_end+1
+            if kind==1: value=struct.unpack_from("<d",data,pos)[0]; pos+=8
+            elif kind==2:
+                n=struct.unpack_from("<i",data,pos)[0]; pos+=4
+                if n<1 or pos+n>end: raise ValueError("Invalid BSON string length")
+                value=data[pos:pos+n-1].decode("utf-8",errors="replace"); pos+=n
+            elif kind in (3,4):
+                n=struct.unpack_from("<i",data,pos)[0]
+                if n<5 or pos+n>end: raise ValueError("Invalid nested BSON length")
+                nested=MongoDBEnumerator._parse_bson(data,pos)
+                value=nested if kind==3 else [nested[k] for k in sorted(nested,key=lambda v:int(v)) if k.isdigit()]
+                pos+=n
+            elif kind==5:
+                n=struct.unpack_from("<i",data,pos)[0]; pos+=5
+                if n<0 or pos+n>end: raise ValueError("Invalid BSON binary length")
+                value=data[pos:pos+n].hex(); pos+=n
+            elif kind==8:
+                if pos>=end: raise ValueError("Truncated BSON bool")
+                value=bool(data[pos]); pos+=1
+            elif kind==9: value=struct.unpack_from("<q",data,pos)[0]; pos+=8
+            elif kind==10: value=None
+            elif kind==16: value=struct.unpack_from("<i",data,pos)[0]; pos+=4
+            elif kind==18: value=struct.unpack_from("<q",data,pos)[0]; pos+=8
+            else: raise ValueError(f"Unsupported BSON type {kind}")
+            if pos>end-1: raise ValueError("BSON value outside document")
+            result[key]=value
         return result
-
     @staticmethod
-    def scan(ip: str, port: int = 27017) -> Dict:
-        result = {
-            "module": "mongodb", "target": ip, "port": port,
-            "open": False, "auth_required": True, "version": None,
-            "databases": [], "vulnerabilities": []
-        }
-        if not MongoDBEnumerator.check_open(ip, port):
-            return result
-        result["open"] = True
-
+    def scan(ip: str,port: int=27017)->Dict[str,Any]:
+        result={"module":"mongodb","target":ip,"port":port,"open":False,"auth_required":None,
+                "version":None,"databases":[],"vulnerabilities":[]}
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            s.connect((ip, port))
-
-            # Build hello/isMaster command
-            doc = MongoDBEnumerator._bson_encode({
-                "hello": 1,
-                "$db": "admin"
-            })
-            resp = MongoDBEnumerator._send_op_msg(s, doc)
-            s.close()
-
-            if resp:
-                parsed = MongoDBEnumerator._parse_bson(resp, 16)  # skip header
-                # OP_MSG response has section
-                if "ok" in parsed:
-                    result["auth_required"] = False
-                    result["version"] = parsed.get("maxWireVersion")
-                    # Try to list databases
-                    s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s2.settimeout(5.0)
-                    s2.connect((ip, port))
-                    doc2 = MongoDBEnumerator._bson_encode({
-                        "listDatabases": 1,
-                        "nameOnly": True,
-                        "$db": "admin"
-                    })
-                    resp2 = MongoDBEnumerator._send_op_msg(s2, doc2)
-                    s2.close()
-                    if resp2:
-                        parsed2 = MongoDBEnumerator._parse_bson(resp2, 16)
-                        if "databases" in parsed2:
-                            result["databases"] = [d.get("name") for d in parsed2["databases"] if isinstance(d, dict) and "name" in d]
-                        elif "documents" in parsed2:
-                            result["databases"] = [d.get("name") for d in parsed2["documents"] if isinstance(d, dict) and "name" in d]
-        except Exception as e:
-            result["error"] = str(e)
-
-        if not result["auth_required"]:
-            result["vulnerabilities"].append({
-                "name": "MongoDB accessible without authentication",
-                "severity": "CRITICAL",
-                "cve": "N/A"
-            })
-
+            with socket.create_connection((ip,port),timeout=5) as sock:
+                sock.settimeout(5)
+                hello=MongoDBEnumerator._bson_encode({"hello":1,"$db":"admin"})
+                hello_doc=MongoDBEnumerator._parse_bson(MongoDBEnumerator._send_op_msg(sock,hello,1))
+                result["open"]=True; result["max_wire_version"]=hello_doc.get("maxWireVersion")
+                cmd=MongoDBEnumerator._bson_encode({"listDatabases":1,"nameOnly":True,"$db":"admin"})
+                response=MongoDBEnumerator._parse_bson(MongoDBEnumerator._send_op_msg(sock,cmd,2))
+                if response.get("ok") in (1,1.0,True):
+                    result["auth_required"]=False
+                    result["databases"]=[d.get("name") for d in response.get("databases",[]) if isinstance(d,dict) and d.get("name")]
+                    result["vulnerabilities"].append({"name":"MongoDB database listing accessible without authentication","severity":"HIGH","cve":"N/A"})
+                else:
+                    result["auth_required"]=True; result["auth_error"]=str(response.get("errmsg","not authorized"))[:200]
+        except (OSError,ValueError,struct.error,ConnectionError) as exc: result["error"]=type(exc).__name__
         return result
