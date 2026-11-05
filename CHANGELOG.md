@@ -55,7 +55,11 @@ This release records the feature and hardening work present on \`main\`. The rel
 
 ---
 
-## [2.2.4b] — Stabilization candidate (unreleased)
+## [2.2.4b] — Beta prerelease (unreleased)
+
+> **Beta status:** 2.2.4b is an unreleased testing candidate on `fix/2.2.4b-stabilization`. It is not an official release artifact and is not recommended for production use. The stable `main` line remains 2.2.0.
+
+This beta concentrates on protocol wire-format correctness, evidence-based detection, CLI dispatch, and cross-platform regression coverage. No GitHub Release, tag, or PyPI distribution has been published for this candidate.
 
 ### Fixed
 - Repair SNMP BER integer, OID, and response parsing; use cross-platform executable discovery for the optional snmpwalk fallback.
@@ -68,10 +72,13 @@ This release records the feature and hardening work present on \`main\`. The rel
 - Route interactive protocol menu actions through their actual protocol modules and preserve per-port results for duplicate service names.
 - Accept HTTP(S) URLs as legacy CLI scan targets and handle async scan exceptions without a missing import.
 
-### Validation
-- Add protocol parser and dispatch regression tests.
+### Beta validation
+- Add protocol parser and dispatch regression tests; the complete automated suite passes (48 tests).
 - Extend Bandit checks to the modified protocol and aggregator modules.
-- Release readiness depends on the complete Python 3.10–3.12 Linux/Windows test matrix.
+- The six-job Linux/Windows matrix passes on Python 3.10, 3.11, and 3.12.
+- Bandit at `-ll` reports zero medium/high findings; seven low-severity findings remain.
+- The dependency audit passes on the Linux Python 3.12 job.
+- CI validates automated coverage and static checks, not live interoperability with every real-world service. Continue authorized lab validation before treating the beta as production-ready.
 
 ## [Unreleased]
 
