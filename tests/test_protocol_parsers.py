@@ -94,7 +94,7 @@ class TestRDPAndRTSP(unittest.TestCase):
         self.assertFalse(_parse_negotiation(response)["nla"])
     def test_rtsp_headers_and_sdp_are_separate(self):
         raw = (b"RTSP/1.0 200 OK\r\nServer: camera-test\r\nContent-Type: application/sdp\r\n"
-               b"Content-Length: 25\r\n\r\nv=0\r\nm=video 5004 RTP/AVP 96\r\n")
+               b"Content-Length: 30\r\n\r\nv=0\r\nm=video 5004 RTP/AVP 96\r\n")
         parsed = _parse_response(raw)
         self.assertEqual(parsed["status_code"], 200)
         self.assertEqual(parsed["server"], "camera-test")
@@ -118,6 +118,8 @@ class TestDispatchAndCli(unittest.TestCase):
         self.assertEqual(set(result["scans"]), {"smb:139", "smb:445", "ldap:389", "ldap:636"})
     def test_legacy_target_resolution_accepts_http_url(self):
         self.assertEqual(SpectraScan.resolve_host("https://127.0.0.1:8443/admin?q=1"), "127.0.0.1")
+    def test_legacy_target_resolution_accepts_bare_host_port(self):
+        self.assertEqual(SpectraScan.resolve_host("127.0.0.1:8080"), "127.0.0.1")
     def test_interactive_protocol_menu_uses_real_module_adapter(self):
         fake = {"module": "mongodb", "open": True}
         with patch("modules.mongodb_enum.MongoDBEnumerator.scan", return_value=fake) as scan:

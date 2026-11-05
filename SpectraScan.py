@@ -4393,17 +4393,23 @@ def normalize_target(target: str) -> str:
 
 
 def resolve_host(hostname: str) -> str:
-    """Resolve an IP, hostname, or HTTP(S) URL to the IPv4 address used by legacy probes."""
+    """Resolve an IP, hostname, host:port, or HTTP(S) URL for legacy IPv4 probes."""
     target = normalize_target(hostname)
     if not target:
         raise ValueError("Target cannot be empty")
-    parsed = urllib.parse.urlsplit(target)
-    if parsed.scheme:
+    if "://" in target:
+        parsed = urllib.parse.urlsplit(target)
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
             raise ValueError("Only valid HTTP(S) URLs can be used as scan targets")
         host = parsed.hostname
     else:
         host = target
+        if host.startswith("[") and "]" in host:
+            host = host[1:host.index("]")]
+        elif host.count(":") == 1:
+            candidate, port = host.rsplit(":", 1)
+            if port.isdigit() and candidate:
+                host = candidate
     try:
         return str(ipaddress.ip_address(host))
     except ValueError:

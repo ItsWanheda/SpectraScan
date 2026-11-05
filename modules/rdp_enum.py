@@ -10,7 +10,7 @@ PROTOCOL_HYBRID=0x02
 PROTOCOL_HYBRID_EX=0x08
 
 def _connection_request(protocols: int)->bytes:
-    cookie=b"Cookie: mstshash:spectrascan\r\n"
+    cookie=b"Cookie: mstshash=spectrascan\r\n"
     negotiation=struct.pack("<BBHI",1,0,8,protocols)
     # X.224 CR: LI, code, dst-ref, src-ref, class, cookie, negotiation.
     body=b"\xE0\x00\x00\x00\x00\x00"+cookie+negotiation

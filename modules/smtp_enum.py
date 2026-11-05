@@ -94,7 +94,7 @@ class SMTPEnumerator:
         try:
             with socket.create_connection((ip,port),timeout=timeout) as sock:
                 _recv_response(sock,timeout); capabilities=SMTPEnumerator._ehlo(sock,timeout)
-                if not any("STARTTLS" in line.upper() for line in capabilities[1:]): return False
+                if not any("STARTTLS" in line.upper() for line in capabilities): return False
                 SMTPEnumerator._send(sock,"STARTTLS")
                 return _code(_recv_response(sock,timeout))==220
         except (OSError,ValueError,ConnectionError): return False
