@@ -17,6 +17,27 @@ def _connection_request(protocols: int)->bytes:
     tpdu=bytes([len(body)])+body
     return struct.pack(">BBH",3,0,len(tpdu)+4)+tpdu
 
+def _recv_tpkt(sock: socket.socket, max_size: int=4096)->bytes:
+    header=bytearray()
+    while len(header)<4:
+        chunk=sock.recv(4-len(header))
+        if not chunk:
+            return b""
+        header.extend(chunk)
+    if header[0]!=3 or header[1]!=0:
+        return bytes(header)
+    declared=struct.unpack_from(">H",header,2)[0]
+    if declared<4 or declared>max_size:
+        return bytes(header)
+    packet=header
+    while len(packet)<declared:
+        chunk=sock.recv(declared-len(packet))
+        if not chunk:
+            return bytes(packet)
+        packet.extend(chunk)
+    return bytes(packet)
+
+
 def _parse_negotiation(data: bytes)->Dict[str,Any]:
     result={"responds":False,"nla":None,"selected_protocol":None}
     # TPKT: version 3, reserved 0, and an exact 16-bit packet length.
@@ -71,7 +92,7 @@ class RDPEnumerator:
             with socket.create_connection((ip,port),timeout=timeout) as sock:
                 sock.settimeout(timeout)
                 sock.sendall(_connection_request(PROTOCOL_RDP|PROTOCOL_SSL|PROTOCOL_HYBRID|PROTOCOL_HYBRID_EX))
-                data=sock.recv(4096)
+                data=_recv_tpkt(sock)
             parsed=_parse_negotiation(data); result.update(parsed)
             result["nla_likely"]=parsed.get("nla"); result["raw"]=data.hex()[:256]
         except (OSError,ConnectionError) as exc: result["error"]=type(exc).__name__
