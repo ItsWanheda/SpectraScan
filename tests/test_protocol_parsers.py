@@ -13,7 +13,7 @@ from modules.rdp_enum import RDPEnumerator, _parse_negotiation
 from modules.redis_enum import _read_resp
 from modules.rtsp_enum import _parse_response
 from modules.smtp_enum import _recv_response
-from modules.snmp_enum import SNMPEnumerator, SNMPError, _decode_oid, _integer, _oid, _parse_response, _tlv
+from modules.snmp_enum import SNMPEnumerator, SNMPError, _decode_oid, _integer, _oid, _parse_response as _parse_snmp_response, _tlv
 
 class FakeSocket:
     def __init__(self, payload):
@@ -58,7 +58,7 @@ class TestSNMPEncoding(unittest.TestCase):
 
     def test_response_requires_matching_request_id_and_community(self):
         response = build_snmp_response()
-        self.assertEqual(_parse_response(response, expected_request_id=7, expected_community="public"), "test-agent")
+        self.assertEqual(_parse_snmp_response(response, expected_request_id=7, expected_community="public"), "test-agent")
         with self.assertRaises(SNMPError):
             _parse_response(response, expected_request_id=8, expected_community="public")
         with self.assertRaises(SNMPError):
