@@ -171,6 +171,8 @@ class TestSMTPResponses(unittest.TestCase):
             _recv_response(FakeSocket(b"250-first\r\n250-final\r\n"))
         with self.assertRaises(ValueError):
             _recv_response(FakeSocket(b"25x malformed\r\n"))
+        with self.assertRaises(ValueError):
+            _recv_response(FakeSocket(b"250 OK"))
 
 class TestDispatchAndCli(unittest.TestCase):
     def test_protocol_results_do_not_overwrite_same_service(self):
