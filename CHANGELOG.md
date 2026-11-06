@@ -90,7 +90,7 @@ This release records the feature and hardening work present on \`main\`. The rel
 
 ## [2.2.4b] — Beta prerelease (unreleased)
 
-> **Beta status:** 2.2.4b is an unreleased testing candidate on `fix/2.2.4b-stabilization`. It is not an official release artifact and is not recommended for production use. The stable `main` line remains 2.2.0.
+> **Historical beta note:** At the time this prerelease was prepared, 2.2.4b was an unreleased testing candidate on `fix/2.2.4b-stabilization`; it was superseded by the 2.2.4 stable-release work documented above.
 
 This beta concentrates on protocol wire-format correctness, evidence-based detection, CLI dispatch, and cross-platform regression coverage. No GitHub Release, tag, or PyPI distribution has been published for this candidate.
 
