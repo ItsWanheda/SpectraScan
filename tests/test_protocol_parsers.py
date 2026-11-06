@@ -60,9 +60,9 @@ class TestSNMPEncoding(unittest.TestCase):
         response = build_snmp_response()
         self.assertEqual(_parse_snmp_response(response, expected_request_id=7, expected_community="public"), "test-agent")
         with self.assertRaises(SNMPError):
-            _parse_response(response, expected_request_id=8, expected_community="public")
+            _parse_snmp_response(response, expected_request_id=8, expected_community="public")
         with self.assertRaises(SNMPError):
-            _parse_response(response, expected_request_id=7, expected_community="private")
+            _parse_snmp_response(response, expected_request_id=7, expected_community="private")
 
 class TestMongoDBBson(unittest.TestCase):
     def test_bool_is_encoded_as_boolean_not_int32(self):
