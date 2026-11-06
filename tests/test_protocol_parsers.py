@@ -158,7 +158,7 @@ class TestSMTPResponses(unittest.TestCase):
     def test_malformed_multiline_and_inconsistent_codes_are_rejected(self):
         with self.assertRaises(ValueError):
             _recv_response(FakeSocket(b"250-first\r\n550 final\r\n"))
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ConnectionError):
             _recv_response(FakeSocket(b"250-first\r\n250-final\r\n"))
         with self.assertRaises(ValueError):
             _recv_response(FakeSocket(b"25x malformed\r\n"))
