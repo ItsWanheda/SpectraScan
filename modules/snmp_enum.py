@@ -69,18 +69,28 @@ def _decode_value(tag: int, raw: bytes) -> str:
     if tag in (128,129,130): return {128:"noSuchObject",129:"noSuchInstance",130:"endOfMibView"}[tag]
     return raw.hex()
 
-def _parse_response(data: bytes, expected_oid: Optional[str]=None) -> str:
+def _parse_response(data: bytes, expected_oid: Optional[str]=None, expected_request_id: Optional[int]=None, expected_community: Optional[str]=None) -> str:
     tag,msg,end=_read_tlv(data)
     if tag!=48 or end!=len(data): raise SNMPError("invalid SNMP envelope")
-    _,_,pos=_read_tlv(msg,0)
-    community_tag,_,pos=_read_tlv(msg,pos)
+    version_tag,version,pos=_read_tlv(msg,0)
+    if version_tag!=2 or int.from_bytes(version,"big",signed=True)!=1:
+        raise SNMPError("unsupported SNMP version")
+    community_tag,community,pos=_read_tlv(msg,pos)
     if community_tag!=4: raise SNMPError("invalid community field")
-    pdu_tag,pdu,_=_read_tlv(msg,pos)
-    if pdu_tag!=162: raise SNMPError("expected GetResponse PDU")
-    _,_,pos=_read_tlv(pdu,0)
+    if expected_community is not None and community!=expected_community.encode("utf-8"):
+        raise SNMPError("SNMP community mismatch")
+    pdu_tag,pdu,pdu_end=_read_tlv(msg,pos)
+    if pdu_tag!=162 or pdu_end!=len(msg): raise SNMPError("expected complete GetResponse PDU")
+    request_tag,request_raw,pos=_read_tlv(pdu,0)
+    if request_tag!=2: raise SNMPError("invalid SNMP request identifier")
+    request_id=int.from_bytes(request_raw,"big",signed=True)
+    if expected_request_id is not None and request_id!=expected_request_id:
+        raise SNMPError("SNMP request identifier mismatch")
     status_tag,status,pos=_read_tlv(pdu,pos)
-    _,_,pos=_read_tlv(pdu,pos)
-    list_tag,bindings,_=_read_tlv(pdu,pos)
+    index_tag,index,pos=_read_tlv(pdu,pos)
+    if index_tag!=2: raise SNMPError("invalid SNMP error index")
+    list_tag,bindings,bindings_end=_read_tlv(pdu,pos)
+    if bindings_end!=len(pdu): raise SNMPError("trailing data in SNMP response PDU")
     if status_tag!=2 or list_tag!=48 or int.from_bytes(status,"big",signed=True)!=0:
         raise SNMPError("SNMP agent returned an error")
     bind_tag,binding,bind_end=_read_tlv(bindings)
@@ -114,11 +124,12 @@ class SNMPEnumerator:
     def query(ip: str, community: str, oid: str, timeout: float=3.0) -> Optional[str]:
         try:
             family=socket.AF_INET6 if ":" in ip else socket.AF_INET
+            request_id=random.randint(1,2**31-1)
             with socket.socket(family,socket.SOCK_DGRAM) as sock:
                 sock.settimeout(timeout)
-                sock.sendto(SNMPEnumerator._build_get_request(community,oid),(ip,161))
+                sock.sendto(SNMPEnumerator._build_get_request(community,oid,request_id),(ip,161))
                 data,_=sock.recvfrom(65535)
-            value=_parse_response(data,oid)
+            value=_parse_response(data,oid,request_id,community)
             return None if value.startswith("noSuch") or value=="NULL" else value
         except (OSError,SNMPError,ValueError): return None
 
