@@ -10,7 +10,7 @@
   </a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Status-Beta-orange.svg" alt="Status">
+  <img src="https://img.shields.io/badge/Status-Stable-brightgreen.svg" alt="Status">
   <img src="https://img.shields.io/badge/Code%20Style-Black-000000.svg" alt="Black">
   <img src="https://img.shields.io/badge/PRs-Welcome-brightgreen.svg" alt="PRs Welcome">
 </p>
