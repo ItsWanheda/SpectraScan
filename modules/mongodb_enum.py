@@ -30,7 +30,7 @@ class MongoDBEnumerator:
         response_length,_,response_to,opcode=struct.unpack("<iiii",header)
         if response_length<21 or response_length>MAX_MESSAGE_SIZE or opcode!=2013:
             raise ValueError("Invalid MongoDB response header")
-        if response_to not in (0,request_id): raise ValueError("MongoDB response id mismatch")
+        if response_to != request_id: raise ValueError("MongoDB response id mismatch")
         payload=_recv_exact(sock,response_length-16)
         if payload[4]!=0: raise ValueError("Unsupported OP_MSG section")
         document=payload[5:]
