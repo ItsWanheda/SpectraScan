@@ -1,23 +1,23 @@
 """RTSP DESCRIBE with correct response header and SDP extraction."""
 from __future__ import annotations
-import socket
+import re, socket
 from typing import Any, Dict, List
 
 def _parse_response(raw: bytes)->Dict[str,Any]:
-    if b"\\r\\n\\r\\n" not in raw:
+    if b"\r\n\r\n" not in raw:
         raise ValueError("RTSP response is missing the header terminator")
-    header,_,body=raw.partition(b"\\r\\n\\r\\n")
+    header,_,body=raw.partition(b"\r\n\r\n")
     try:
-        lines=header.decode("latin-1").split("\\r\\n")
+        lines=header.decode("latin-1").split("\r\n")
     except UnicodeDecodeError as exc:
         raise ValueError("Invalid RTSP headers") from exc
-    if not lines or not __import__("re").fullmatch(r"RTSP/1\\.[0-9] [1-5][0-9]{2}(?: .*)?",lines[0]):
+    if not lines or not re.fullmatch(r"RTSP/1\.[0-9] [1-5][0-9]{2}(?: .*)?",lines[0]):
         raise ValueError("Malformed RTSP status line")
     code=int(lines[0].split(" ",2)[1])
     headers={}
     content_length=None
     for line in lines[1:]:
-        if not line or line[0] in " \\t":
+        if not line or line[0] in " \t":
             raise ValueError("Malformed RTSP header line")
         name,colon,value=line.partition(":")
         if not colon or not name.strip():
