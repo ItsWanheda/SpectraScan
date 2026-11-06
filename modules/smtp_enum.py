@@ -10,7 +10,11 @@ def _recv_line(sock: socket.socket,timeout: float=5.0,max_bytes: int=8192)->str:
         if not part: break
         data.extend(part)
         if data.endswith(b"\n"): break
-    if len(data)>=max_bytes and not data.endswith(b"\n"): raise ValueError("SMTP line too long")
+    if len(data)>=max_bytes and not data.endswith(b"\r\n"): raise ValueError("SMTP line too long")
+    if not data:
+        raise ConnectionError("SMTP server closed connection")
+    if not data.endswith(b"\r\n"):
+        raise ValueError("SMTP response line is not CRLF terminated")
     return data.decode("utf-8",errors="replace").rstrip("\r\n")
 
 def _recv_response(sock: socket.socket,timeout: float=5.0,max_lines: int=100)->List[str]:
