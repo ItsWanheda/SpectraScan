@@ -10,7 +10,7 @@
   </a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/Status-Beta-orange.svg" alt="Status">
+  <img src="https://img.shields.io/badge/Status-Stable-brightgreen.svg" alt="Status">
   <img src="https://img.shields.io/badge/Code%20Style-Black-000000.svg" alt="Black">
   <img src="https://img.shields.io/badge/PRs-Welcome-brightgreen.svg" alt="PRs Welcome">
 </p>
@@ -33,56 +33,36 @@
 
 ---
 
-## 📦 Current stable release: 2.2.0
+## 📦 Current stable release: 2.2.4
 
-The current `main` branch contains the 2.2.0 feature set. This release builds on 2.1.0 with an additive async TCP scanner, bounded optional NVD CVE correlation, stricter CLI validation, bounded CIDR scans, safer credential-checking defaults, and more reliable report exports. See [CHANGELOG.md](CHANGELOG.md) for detailed release notes and [SECURITY.md](SECURITY.md) for supported versions and vulnerability reporting.
+**Version:** `2.2.4` · **Release line:** Stable · **Python:** 3.10–3.12 CI target
 
-> **Release integrity:** this documents the `main` code state; it does not claim a GitHub Release or PyPI package has been published.
+SpectraScan 2.2.4 consolidates the 2.2.4b protocol-stabilization work and adds strict response validation for SNMP, RDP, MongoDB, RTSP, and SMTP. This release hardens packet correlation and framing, rejects malformed protocol responses, and keeps configuration observations separate from confirmed vulnerabilities.
 
-### 🧪 Beta channel: 2.2.4b Beta
+> **Release publication:** This branch prepares the 2.2.4 stable release. The official release artifact and version tag should be considered published only after the release PR is merged and the GitHub Release is created.
 
-> ⚠️ **Pre-release software — testing only.** The `fix/2.2.4b-stabilization` branch is a beta candidate, not a stable release. It may still contain defects or incomplete protocol coverage. Do not use it as your only security control or as the basis for production decisions.
+### 🔒 2.2.4 security and protocol hardening
 
-The current `main` branch remains the stable 2.2.0 line. The **2.2.4b Beta** is a separate pre-release track focused on protocol correctness, more conservative service detection, CLI routing, and cross-platform reliability.
+- **SNMP:** validate SNMPv2c version, response request ID, community string, PDU framing, and the requested OID before accepting a response.
+- **RDP:** validate TPKT declared length, X.224 Connection Confirm framing, and the exact negotiation structure before deriving NLA status.
+- **MongoDB:** require the server's `responseTo` field to match the outstanding request ID; zero is no longer accepted as a wildcard.
+- **RDP findings:** report disabled NLA as a configuration observation, not as a medium-severity vulnerability by itself. BlueKeep remains unassessed without OS and patch-level evidence.
+- **RTSP:** reject malformed status/header framing, duplicate headers, invalid or oversized Content-Length values, and bodies whose received length does not match the declaration.
+- **SMTP:** reject malformed multiline replies, inconsistent status codes, and replies that end before a valid terminating line.
 
-**Beta scope**
-- Corrected SNMP BER, MongoDB OP_MSG/BSON, Redis RESP, MySQL/PostgreSQL framing, and NFS RPC/XDR handling.
-- More evidence-based RDP, RTSP, and SMTP results, including removal of unsupported vulnerability conclusions.
-- Fixed URL target handling, protocol-menu dispatch, async error handling, and per-port aggregation.
-- Added protocol regression coverage and a Linux/Windows CI matrix.
+### 🧪 Validation and regression coverage
 
-**Validation recorded for this beta branch**
-- ✅ Six CI jobs passed: Linux and Windows with Python 3.10, 3.11, and 3.12.
-- ✅ The automated test suite passed (48 tests).
-- ✅ Bandit at the configured `-ll` threshold reported no medium- or high-severity findings; seven low-severity findings remain.
-- ✅ The dependency audit passed on the Linux Python 3.12 job.
+The release adds regression cases for mismatched SNMP request IDs and communities, malformed RDP TPKT/X.224 lengths, MongoDB response correlation, RTSP Content-Length and status handling, and malformed or unterminated SMTP multiline replies.
 
-These checks validate the automated test and static-analysis scope; they do **not** replace live interoperability testing against every supported service or guarantee that every target will be detected correctly. Validate results in an authorized lab and review findings before acting on them.
-
-**Try the beta from source**
+Run the complete local suite with:
 
 ```bash
-git clone https://github.com/ItsWanheda/SpectraScan.git
-cd SpectraScan
-git fetch origin
-git switch --track origin/fix/2.2.4b-stabilization
-python -m venv .venv
-```
-
-Activate the virtual environment, install dependencies, and run the regression suite:
-
-```bash
-# Linux / macOS
-source .venv/bin/activate
-
-# Windows PowerShell
-.\.venv\Scripts\Activate.ps1
-
-python -m pip install -r requirements.txt
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-**Distribution status:** this beta exists on the feature branch only. No official GitHub Release, version tag, or PyPI package has been published for 2.2.4b. The stable release remains 2.2.0 until a final release is explicitly published.
+CI results and any remaining limitations are recorded in the pull request. Automated tests do not replace live interoperability checks against every implementation of these protocols.
+
+See [CHANGELOG.md](CHANGELOG.md) for the complete 2.2.4 notes and [SECURITY.md](SECURITY.md) for supported-version and reporting guidance.
 
 ## 📑 Table of Contents
 

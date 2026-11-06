@@ -10,7 +10,11 @@ def _recv_line(sock: socket.socket,timeout: float=5.0,max_bytes: int=8192)->str:
         if not part: break
         data.extend(part)
         if data.endswith(b"\n"): break
-    if len(data)>=max_bytes and not data.endswith(b"\n"): raise ValueError("SMTP line too long")
+    if len(data)>=max_bytes and not data.endswith(b"\r\n"): raise ValueError("SMTP line too long")
+    if not data:
+        raise ConnectionError("SMTP server closed connection")
+    if not data.endswith(b"\r\n"):
+        raise ValueError("SMTP response line is not CRLF terminated")
     return data.decode("utf-8",errors="replace").rstrip("\r\n")
 
 def _recv_response(sock: socket.socket,timeout: float=5.0,max_lines: int=100)->List[str]:
@@ -18,17 +22,18 @@ def _recv_response(sock: socket.socket,timeout: float=5.0,max_lines: int=100)->L
     for _ in range(max_lines):
         line=_recv_line(sock,timeout)
         if not line:
-            if lines: break
-            raise ConnectionError("SMTP server closed connection")
-        lines.append(line)
-        if len(line)<3 or not line[:3].isdigit():
-            if expected is None: break
-            continue
+            raise ConnectionError("SMTP server closed before response terminator")
+        if len(line)<3 or not line[:3].isdigit() or (len(line)>3 and line[3] not in " -"):
+            raise ValueError("Malformed SMTP response line")
         code=line[:3]
-        if expected is None: expected=code
-        if code==expected and (len(line)==3 or line[3:4]!="-"): return lines
-    if len(lines)>=max_lines: raise ValueError("SMTP multiline response too large")
-    return lines
+        if expected is None:
+            expected=code
+        elif code!=expected:
+            raise ValueError("Inconsistent SMTP status code in multiline response")
+        lines.append(line)
+        if len(line)==3 or line[3:4]==" ":
+            return lines
+    raise ValueError("SMTP multiline response too large or missing final line")
 
 def _code(lines: List[str])->Optional[int]:
     return int(lines[0][:3]) if lines and len(lines[0])>=3 and lines[0][:3].isdigit() else None

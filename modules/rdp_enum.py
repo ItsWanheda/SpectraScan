@@ -17,19 +17,57 @@ def _connection_request(protocols: int)->bytes:
     tpdu=bytes([len(body)])+body
     return struct.pack(">BBH",3,0,len(tpdu)+4)+tpdu
 
+def _recv_tpkt(sock: socket.socket, max_size: int=4096)->bytes:
+    header=bytearray()
+    while len(header)<4:
+        chunk=sock.recv(4-len(header))
+        if not chunk:
+            return b""
+        header.extend(chunk)
+    if header[0]!=3 or header[1]!=0:
+        return bytes(header)
+    declared=struct.unpack_from(">H",header,2)[0]
+    if declared<4 or declared>max_size:
+        return bytes(header)
+    packet=header
+    while len(packet)<declared:
+        chunk=sock.recv(declared-len(packet))
+        if not chunk:
+            return bytes(packet)
+        packet.extend(chunk)
+    return bytes(packet)
+
+
 def _parse_negotiation(data: bytes)->Dict[str,Any]:
     result={"responds":False,"nla":None,"selected_protocol":None}
-    if len(data)<11 or data[0]!=3: return result
+    # TPKT: version 3, reserved 0, and an exact 16-bit packet length.
+    if len(data)<4 or data[0]!=3 or data[1]!=0:
+        return result
+    declared=struct.unpack_from(">H",data,2)[0]
+    if declared!=len(data) or declared<12:
+        return result
+    # X.224 Connection Confirm (LI=6, code=0xD0, refs, class).
+    li=data[4]
+    if li!=6 or li!=len(data[5:]) - 8 or data[5]!=0xD0:
+        return result
+    negotiation_offset=5+li
+    if len(data)!=negotiation_offset+8:
+        return result
+    packet_type,flags,packet_length=struct.unpack_from("<BBH",data,negotiation_offset)
+    if packet_length!=8:
+        return result
     result["responds"]=True
-    for pos in range(4,len(data)-7):
-        if data[pos]==2 and data[pos+2:pos+4]==b"\x08\x00":
-            selected=struct.unpack_from("<I",data,pos+4)[0]
-            result["selected_protocol"]=selected
-            result["nla"]=selected in (PROTOCOL_HYBRID,PROTOCOL_HYBRID_EX)
+    if packet_type==2:
+        selected=struct.unpack_from("<I",data,negotiation_offset+4)[0]
+        if selected not in (PROTOCOL_RDP,PROTOCOL_SSL,PROTOCOL_HYBRID,PROTOCOL_HYBRID_EX):
+            result["responds"]=False
             return result
-        if data[pos]==3 and data[pos+2:pos+4]==b"\x08\x00":
-            result["negotiation_failure"]=struct.unpack_from("<I",data,pos+4)[0]
-            return result
+        result["selected_protocol"]=selected
+        result["nla"]=selected in (PROTOCOL_HYBRID,PROTOCOL_HYBRID_EX)
+    elif packet_type==3:
+        result["negotiation_failure"]=struct.unpack_from("<I",data,negotiation_offset+4)[0]
+    else:
+        result["responds"]=False
     return result
 
 class RDPEnumerator:
@@ -54,7 +92,7 @@ class RDPEnumerator:
             with socket.create_connection((ip,port),timeout=timeout) as sock:
                 sock.settimeout(timeout)
                 sock.sendall(_connection_request(PROTOCOL_RDP|PROTOCOL_SSL|PROTOCOL_HYBRID|PROTOCOL_HYBRID_EX))
-                data=sock.recv(4096)
+                data=_recv_tpkt(sock)
             parsed=_parse_negotiation(data); result.update(parsed)
             result["nla_likely"]=parsed.get("nla"); result["raw"]=data.hex()[:256]
         except (OSError,ConnectionError) as exc: result["error"]=type(exc).__name__
@@ -68,10 +106,9 @@ class RDPEnumerator:
         negotiation=RDPEnumerator.check_nla(ip,port)
         result["nla"]=negotiation.get("nla_likely")
         if result["nla"] is False:
-            result["vulnerabilities"].append({
-                "name":"RDP negotiated without Network Level Authentication","severity":"MEDIUM","cve":"N/A",
-                "evidence":f"Server selected protocol {negotiation.get('selected_protocol')}.",
-            })
+            result["observations"].append(
+                "The server did not negotiate NLA for this connection request. This is a configuration observation, not a confirmed vulnerability."
+            )
         elif result["nla"] is True:
             result["observations"].append("RDP negotiation selected an NLA-capable protocol.")
         else:

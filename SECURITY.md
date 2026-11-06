@@ -4,20 +4,16 @@ SpectraScan is a network reconnaissance and security-assessment toolkit. Its act
 
 ## Supported versions
 
-This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The current \`main\` branch documents version 2.2.0. A supported version does not mean every optional module is free of defects; apply updates and validate findings before acting on them.
+This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The current release line is **2.2.4 (stable)**. A supported version does not mean every optional module is free of defects; apply updates and validate findings before acting on them.
 
 | Version line | Security support | Notes |
 |---|---|---|
-| **2.2.x (stable)** | ✅ Current | Stable line; the current `main` branch documents 2.2.0 |
-| **2.2.4b Beta** | 🧪 Preview only | Unreleased branch candidate; testing only, not a supported production release |
-| **2.1.x** | ⚠️ Best effort | Upgrade to 2.2.x where possible |
+| **2.2.4 (stable)** | ✅ Current | Current stable release line |
+| **2.2.x** | ⚠️ Best effort | Upgrade to the latest 2.2.x release for current fixes |
+| **2.1.x** | ⚠️ Best effort | Upgrade to 2.2.4 where possible |
 | **2.0.x and earlier** | ❌ Unsupported | Upgrade before relying on security fixes |
 
-Only versions explicitly published as releases should be treated as official release artifacts. The version documented on `main` may be ahead of a tagged release.
-
-### Beta and other pre-release builds
-
-The **2.2.4b Beta** is available only from the `fix/2.2.4b-stabilization` development branch. It has passed the documented automated Linux/Windows Python 3.10–3.12 CI matrix, but that does not establish complete protocol interoperability or production readiness. Treat it as preview software: test only in authorized, controlled environments, expect defects, and do not rely on it as the sole protection for production assets. Beta builds do not receive the same support commitment as published stable releases.
+Only versions explicitly published as GitHub Releases should be treated as official release artifacts. This branch prepares version 2.2.4; the release becomes published when the release PR is merged and its GitHub tag/release is created.
 
 ## Reporting a vulnerability
 

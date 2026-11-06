@@ -9,16 +9,18 @@ from modules import network_services
 from modules.database_enum import MySQLEnumerator, PostgreSQLEnumerator
 from modules.mongodb_enum import MongoDBEnumerator
 from modules.nfs_enum import _parse_exports, _parse_portmap_dump
-from modules.rdp_enum import _parse_negotiation
+from modules.rdp_enum import RDPEnumerator, _parse_negotiation
 from modules.redis_enum import _read_resp
 from modules.rtsp_enum import _parse_response
 from modules.smtp_enum import _recv_response
-from modules.snmp_enum import SNMPEnumerator, _decode_oid, _oid
+from modules.snmp_enum import SNMPEnumerator, SNMPError, _decode_oid, _integer, _oid, _parse_response as _parse_snmp_response, _tlv
 
 class FakeSocket:
     def __init__(self, payload):
         self.payload = bytearray(payload)
     def settimeout(self, _timeout):
+        pass
+    def sendall(self, _data):
         pass
     def recv(self, size):
         chunk = bytes(self.payload[:size])
@@ -28,6 +30,19 @@ class FakeSocket:
 def xdr_string(value):
     raw = value.encode()
     return struct.pack(">I", len(raw)) + raw + (b"\x00" * ((-len(raw)) % 4))
+
+def build_snmp_response(request_id=7, community="public", oid="1.3.6.1.2.1.1.1.0"):
+    binding = _tlv(0x30, _oid(oid) + _tlv(0x04, b"test-agent"))
+    bindings = _tlv(0x30, binding)
+    pdu = _tlv(0xA2, _integer(request_id) + _integer(0) + _integer(0) + bindings)
+    return _tlv(0x30, _integer(1) + _tlv(0x04, community.encode()) + pdu)
+
+
+def build_rdp_confirm(selected_protocol):
+    x224 = b"\x06\xd0\x00\x00\x00\x00\x00"
+    negotiation = struct.pack("<BBHI", 2, 0, 8, selected_protocol)
+    payload = x224 + negotiation
+    return b"\x03\x00" + struct.pack(">H", len(payload) + 4) + payload
 
 class TestSNMPEncoding(unittest.TestCase):
     def test_oid_uses_base128_arc_encoding(self):
@@ -41,6 +56,14 @@ class TestSNMPEncoding(unittest.TestCase):
         self.assertEqual(packet[0], 0x30)
         self.assertEqual(packet[2], 0x02)
 
+    def test_response_requires_matching_request_id_and_community(self):
+        response = build_snmp_response()
+        self.assertEqual(_parse_snmp_response(response, expected_request_id=7, expected_community="public"), "test-agent")
+        with self.assertRaises(SNMPError):
+            _parse_snmp_response(response, expected_request_id=8, expected_community="public")
+        with self.assertRaises(SNMPError):
+            _parse_snmp_response(response, expected_request_id=7, expected_community="private")
+
 class TestMongoDBBson(unittest.TestCase):
     def test_bool_is_encoded_as_boolean_not_int32(self):
         encoded = MongoDBEnumerator._bson_encode({"enabled": True, "count": 3})
@@ -52,6 +75,15 @@ class TestMongoDBBson(unittest.TestCase):
     def test_invalid_document_length_is_rejected(self):
         with self.assertRaises(ValueError):
             MongoDBEnumerator._parse_bson(b"\x04\x00\x00\x00\x00")
+
+    def test_op_msg_requires_exact_response_to_correlation(self):
+        document = MongoDBEnumerator._bson_encode({"ok": 1})
+        payload = struct.pack("<I", 0) + b"\x00" + document
+        response = struct.pack("<iiii", 16 + len(payload), 99, 5, 2013) + payload
+        self.assertEqual(MongoDBEnumerator._send_op_msg(FakeSocket(response), b"request", request_id=5), document)
+        wrong = struct.pack("<iiii", 16 + len(payload), 99, 0, 2013) + payload
+        with self.assertRaisesRegex(ValueError, "response id mismatch"):
+            MongoDBEnumerator._send_op_msg(FakeSocket(wrong), b"request", request_id=5)
 
 class TestRedisResp(unittest.TestCase):
     def test_simple_bulk_integer_and_array_responses(self):
@@ -85,21 +117,44 @@ class TestNFSXdr(unittest.TestCase):
 
 class TestRDPAndRTSP(unittest.TestCase):
     def test_rdp_hybrid_response_is_nla_capable(self):
-        response = b"\x03\x00\x00\x0c\x02\x00\x08\x00" + struct.pack("<I", 2)
-        parsed = _parse_negotiation(response)
+        parsed = _parse_negotiation(build_rdp_confirm(2))
         self.assertTrue(parsed["nla"])
         self.assertEqual(parsed["selected_protocol"], 2)
     def test_rdp_ssl_response_is_not_nla(self):
-        response = b"\x03\x00\x00\x0c\x02\x00\x08\x00" + struct.pack("<I", 1)
-        self.assertFalse(_parse_negotiation(response)["nla"])
+        self.assertFalse(_parse_negotiation(build_rdp_confirm(1))["nla"])
+
+    def test_disabled_nla_is_observation_not_vulnerability(self):
+        with patch.object(RDPEnumerator, "check_open", return_value=True), patch.object(
+            RDPEnumerator, "check_nla",
+            return_value={"nla_likely": False, "selected_protocol": 1}
+        ):
+            result = RDPEnumerator.scan("127.0.0.1")
+        self.assertEqual(result["vulnerabilities"], [])
+        self.assertTrue(any("configuration observation" in item for item in result["observations"]))
+    def test_rdp_rejects_bad_tpkt_and_negotiation_lengths(self):
+        packet = build_rdp_confirm(2)
+        self.assertFalse(_parse_negotiation(packet[:-1])["responds"])
+        malformed = packet[:2] + struct.pack(">H", len(packet) + 1) + packet[4:]
+        self.assertFalse(_parse_negotiation(malformed)["responds"])
+        malformed = packet[:-8] + struct.pack("<BBHI", 2, 0, 7, 2)
+        malformed = malformed[:2] + struct.pack(">H", len(malformed)) + malformed[4:]
+        self.assertFalse(_parse_negotiation(malformed)["responds"])
     def test_rtsp_headers_and_sdp_are_separate(self):
+        body = b"v=0\r\nm=video 5004 RTP/AVP 96\r\n"
         raw = (b"RTSP/1.0 200 OK\r\nServer: camera-test\r\nContent-Type: application/sdp\r\n"
-               b"Content-Length: 30\r\n\r\nv=0\r\nm=video 5004 RTP/AVP 96\r\n")
+               + f"Content-Length: {len(body)}".encode() + b"\r\n\r\n" + body)
         parsed = _parse_response(raw)
         self.assertEqual(parsed["status_code"], 200)
         self.assertEqual(parsed["server"], "camera-test")
         self.assertEqual(parsed["streams"][0]["port"], 5004)
         self.assertEqual(parsed["streams"][0]["type"], "video")
+    def test_rtsp_rejects_malformed_status_and_content_length(self):
+        with self.assertRaises(ValueError):
+            _parse_response(b"RTSP/1.0 200OK\r\n\r\n")
+        with self.assertRaises(ValueError):
+            _parse_response(b"RTSP/1.0 200 OK\r\nContent-Length: 8\r\n\r\nshort")
+        with self.assertRaises(ValueError):
+            _parse_response(b"RTSP/1.0 200 OK\r\nContent-Length: 0\r\ncontent-length: 0\r\n\r\n")
 
 class TestSMTPResponses(unittest.TestCase):
     def test_multiline_ehlo_is_consumed_until_final_code_line(self):
@@ -108,6 +163,16 @@ class TestSMTPResponses(unittest.TestCase):
         self.assertEqual(len(response), 3)
         self.assertTrue(any("STARTTLS" in line for line in response))
         self.assertEqual(_recv_response(sock), ["220 Ready"])
+
+    def test_malformed_multiline_and_inconsistent_codes_are_rejected(self):
+        with self.assertRaises(ValueError):
+            _recv_response(FakeSocket(b"250-first\r\n550 final\r\n"))
+        with self.assertRaises(ConnectionError):
+            _recv_response(FakeSocket(b"250-first\r\n250-final\r\n"))
+        with self.assertRaises(ValueError):
+            _recv_response(FakeSocket(b"25x malformed\r\n"))
+        with self.assertRaises(ValueError):
+            _recv_response(FakeSocket(b"250 OK"))
 
 class TestDispatchAndCli(unittest.TestCase):
     def test_protocol_results_do_not_overwrite_same_service(self):
