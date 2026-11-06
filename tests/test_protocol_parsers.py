@@ -13,12 +13,14 @@ from modules.rdp_enum import _parse_negotiation
 from modules.redis_enum import _read_resp
 from modules.rtsp_enum import _parse_response
 from modules.smtp_enum import _recv_response
-from modules.snmp_enum import SNMPEnumerator, _decode_oid, _oid
+from modules.snmp_enum import SNMPEnumerator, SNMPError, _decode_oid, _integer, _oid, _parse_response, _tlv
 
 class FakeSocket:
     def __init__(self, payload):
         self.payload = bytearray(payload)
     def settimeout(self, _timeout):
+        pass
+    def sendall(self, _data):
         pass
     def recv(self, size):
         chunk = bytes(self.payload[:size])
@@ -40,6 +42,14 @@ class TestSNMPEncoding(unittest.TestCase):
         packet = SNMPEnumerator._build_get_request("public", "1.3.6.1.2.1.1.1.0", 7)
         self.assertEqual(packet[0], 0x30)
         self.assertEqual(packet[2], 0x02)
+
+    def test_response_requires_matching_request_id_and_community(self):
+        response = build_snmp_response()
+        self.assertEqual(_parse_response(response, expected_request_id=7, expected_community="public"), "test-agent")
+        with self.assertRaises(SNMPError):
+            _parse_response(response, expected_request_id=8, expected_community="public")
+        with self.assertRaises(SNMPError):
+            _parse_response(response, expected_request_id=7, expected_community="private")
 
 class TestMongoDBBson(unittest.TestCase):
     def test_bool_is_encoded_as_boolean_not_int32(self):
@@ -108,6 +118,14 @@ class TestSMTPResponses(unittest.TestCase):
         self.assertEqual(len(response), 3)
         self.assertTrue(any("STARTTLS" in line for line in response))
         self.assertEqual(_recv_response(sock), ["220 Ready"])
+
+    def test_malformed_multiline_and_inconsistent_codes_are_rejected(self):
+        with self.assertRaises(ValueError):
+            _recv_response(FakeSocket(b"250-first\\r\\n550 final\\r\\n"))
+        with self.assertRaises(ValueError):
+            _recv_response(FakeSocket(b"250-first\\r\\n250-final\\r\\n"))
+        with self.assertRaises(ValueError):
+            _recv_response(FakeSocket(b"25x malformed\\r\\n"))
 
 class TestDispatchAndCli(unittest.TestCase):
     def test_protocol_results_do_not_overwrite_same_service(self):
