@@ -9,7 +9,7 @@ from modules import network_services
 from modules.database_enum import MySQLEnumerator, PostgreSQLEnumerator
 from modules.mongodb_enum import MongoDBEnumerator
 from modules.nfs_enum import _parse_exports, _parse_portmap_dump
-from modules.rdp_enum import _parse_negotiation
+from modules.rdp_enum import RDPEnumerator, _parse_negotiation
 from modules.redis_enum import _read_resp
 from modules.rtsp_enum import _parse_response
 from modules.smtp_enum import _recv_response
@@ -122,6 +122,15 @@ class TestRDPAndRTSP(unittest.TestCase):
         self.assertEqual(parsed["selected_protocol"], 2)
     def test_rdp_ssl_response_is_not_nla(self):
         self.assertFalse(_parse_negotiation(build_rdp_confirm(1))["nla"])
+
+    def test_disabled_nla_is_observation_not_vulnerability(self):
+        with patch.object(RDPEnumerator, "check_open", return_value=True), patch.object(
+            RDPEnumerator, "check_nla",
+            return_value={"nla_likely": False, "selected_protocol": 1}
+        ):
+            result = RDPEnumerator.scan("127.0.0.1")
+        self.assertEqual(result["vulnerabilities"], [])
+        self.assertTrue(any("configuration observation" in item for item in result["observations"]))
     def test_rdp_rejects_bad_tpkt_and_negotiation_lengths(self):
         packet = build_rdp_confirm(2)
         self.assertFalse(_parse_negotiation(packet[:-1])["responds"])
