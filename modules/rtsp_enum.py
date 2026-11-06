@@ -4,25 +4,52 @@ import socket
 from typing import Any, Dict, List
 
 def _parse_response(raw: bytes)->Dict[str,Any]:
-    text=raw.decode("latin-1",errors="replace")
-    header,sep,body=text.partition("\r\n\r\n")
-    lines=header.split("\r\n")
-    status=lines[0].split(" ",2) if lines else []
-    code=int(status[1]) if len(status)>1 and status[1].isdigit() else None
+    if b"\\r\\n\\r\\n" not in raw:
+        raise ValueError("RTSP response is missing the header terminator")
+    header,_,body=raw.partition(b"\\r\\n\\r\\n")
+    try:
+        lines=header.decode("latin-1").split("\\r\\n")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Invalid RTSP headers") from exc
+    if not lines or not __import__("re").fullmatch(r"RTSP/1\\.[0-9] [1-5][0-9]{2}(?: .*)?",lines[0]):
+        raise ValueError("Malformed RTSP status line")
+    code=int(lines[0].split(" ",2)[1])
     headers={}
+    content_length=None
     for line in lines[1:]:
+        if not line or line[0] in " \\t":
+            raise ValueError("Malformed RTSP header line")
         name,colon,value=line.partition(":")
-        if colon: headers[name.strip().lower()]=value.strip()
+        if not colon or not name.strip():
+            raise ValueError("Malformed RTSP header")
+        key=name.strip().lower()
+        if key in headers:
+            raise ValueError("Duplicate RTSP header")
+        value=value.strip()
+        headers[key]=value
+        if key=="content-length":
+            if not value.isdigit():
+                raise ValueError("Invalid RTSP Content-Length")
+            content_length=int(value)
+            if content_length>65536:
+                raise ValueError("RTSP body exceeds parser limit")
+    if content_length is not None and len(body)!=content_length:
+        raise ValueError("RTSP Content-Length does not match received body")
+    body_text=body.decode("latin-1")
     streams=[]
-    for line in body.splitlines() if sep else []:
+    for line in body_text.splitlines():
         if line.startswith("m="):
             parts=line[2:].split()
-            if len(parts)>=3:
-                streams.append({"type":parts[0],"port":int(parts[1]) if parts[1].isdigit() else None,
-                                "protocol":parts[2],"formats":parts[3:]})
-    return {"status_code":code,"status_line":lines[0] if lines else "",
-            "headers":headers,"body":body,"streams":streams,"server":headers.get("server"),
-            "auth_required":code==401 or "www-authenticate" in headers,"open":code is not None}
+            if len(parts)<3:
+                raise ValueError("Malformed SDP media line")
+            port_text=parts[1].split("/",1)[0]
+            if not port_text.isdigit():
+                raise ValueError("Invalid SDP media port")
+            streams.append({"type":parts[0],"port":int(port_text),
+                            "protocol":parts[2],"formats":parts[3:]})
+    return {"status_code":code,"status_line":lines[0],
+            "headers":headers,"body":body_text,"streams":streams,"server":headers.get("server"),
+            "auth_required":code==401 or "www-authenticate" in headers,"open":True}
 
 class RTSPEnumerator:
     DEFAULT_PORT=554
