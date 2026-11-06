@@ -15,6 +15,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.2.4] — Stable release preparation (2026-11-07)
+
+> **Release status:** This branch prepares the 2.2.4 stable release. The version becomes an official published artifact when the release PR is merged and the corresponding GitHub tag/release is created.
+
+### Security
+
+- Validate SNMPv2c response version, request ID, community string, response PDU boundaries, and requested OID before accepting returned values.
+- Require MongoDB OP_MSG `responseTo` to equal the outstanding request ID; reject zero and every other mismatched value.
+- Remove the unsupported medium-severity RDP finding for disabled NLA. NLA negotiation without HYBRID/HYBRID_EX is retained as a configuration observation, not a confirmed vulnerability.
+- Keep BlueKeep status explicitly unassessed unless product, OS, and patch-level evidence is available.
+
+### Fixed
+
+- Enforce exact TPKT length, X.224 Connection Confirm type/length, and RDP negotiation structure before reporting a server response or NLA capability.
+- Validate RTSP status-line syntax and header structure; reject duplicate headers, malformed or oversized Content-Length values, and body-length mismatches.
+- Enforce SMTP multiline reply grammar, consistent three-digit status codes, valid terminating lines, and explicit failure for incomplete responses.
+
+### Tests
+
+- Add regression coverage for SNMP request-ID/community mismatches.
+- Add RDP malformed TPKT and negotiation-length cases.
+- Add MongoDB response-correlation tests for matching and zero/mismatched `responseTo` values.
+- Add RTSP malformed status, duplicate Content-Length, and declared-body-length tests.
+- Add SMTP inconsistent-code, malformed-line, and unterminated multiline-response tests.
+
+### Documentation
+
+- Replace the stale 2.2.0/Beta status in the README with the 2.2.4 stable-release target and its protocol/security changes.
+- Align supported-version guidance with the 2.2.4 release line.
+- Add a canonical `VERSION` file containing `2.2.4`.
+
+---
+
 ## [2.2.0] — 2026-10-22
 
 This release records the feature and hardening work present on \`main\`. The release number follows Semantic Versioning: 2.2.0 is a backward-compatible minor release after 2.1.0.
